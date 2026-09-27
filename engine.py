@@ -20,7 +20,7 @@ CONFIG = {
     "FLATTEN_BUFFER_MINUTES": 45,      # Exit all inventory 45 min before settlement
     "MAX_REQUESTS_PER_SECOND": 8.0,    # Token-bucket rate limit (Kalshi anti-429)
     "WATCHDOG_TIMEOUT_SECONDS": 6.0,   # Dead man's switch trip threshold
-    "MAX_CLOCK_DRIFT_MS": 250,         # Maximum allowable system clock drift
+    "MAX_CLOCK_DRIFT_MS": 2000,         # Maximum allowable system clock drift
     "MANDATORY_POST_ONLY": True,       # Reject any order that takes liquidity
     
     # State Bridge
