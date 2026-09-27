@@ -1,0 +1,57 @@
+﻿{
+  "engine_status": "RUNNING",
+  "account_equity": 10485.50,
+  "daily_realized_pnl": 185.50,
+  "shares_traded_today": 8420,
+  "liquid_reserve": 2621.38,
+  "active_slots_used": 20,
+  "active_slots_total": 20,
+  "last_updated": "Live",
+  "active_markets": [
+    {
+      "ticker": "INX-26SEP26-B5825",
+      "market_name": "S&P 500 Daily Close (5800-5825)",
+      "best_bid": 0.48,
+      "best_ask": 0.51,
+      "spread": 0.03,
+      "inventory": 150,
+      "allocated_usd": 375.00,
+      "status": "QUOTING"
+    },
+    {
+      "ticker": "NASDAQ100-26SEP26-B20100",
+      "market_name": "Nasdaq-100 Daily Close Bracket",
+      "best_bid": 0.52,
+      "best_ask": 0.55,
+      "spread": 0.03,
+      "inventory": -50,
+      "allocated_usd": 375.00,
+      "status": "QUOTING"
+    },
+    {
+      "ticker": "KXHIGHNY-26SEP26-T74",
+      "market_name": "New York Daily High Temp > 74°",
+      "best_bid": 0.39,
+      "best_ask": 0.44,
+      "spread": 0.05,
+      "inventory": 0,
+      "allocated_usd": 375.00,
+      "status": "IDLE_BALANCED"
+    },
+    {
+      "ticker": "KXHIGHCHI-26SEP26-T68",
+      "market_name": "Chicago Daily High Temp > 68°",
+      "best_bid": 0.61,
+      "best_ask": 0.65,
+      "spread": 0.04,
+      "inventory": 80,
+      "allocated_usd": 375.00,
+      "status": "QUOTING"
+    }
+  ],
+  "system_logs": [
+    "[10:14:00] Daily screener finished: 20 qualifying daily books selected.",
+    "[10:14:05] Maker limits resting on S&P 500 and NYC High Temp.",
+    "[10:14:10] Pre-Close 45m settlement flattener armed."
+  ]
+}
