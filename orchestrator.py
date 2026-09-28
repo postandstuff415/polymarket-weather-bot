@@ -6,6 +6,7 @@ CLI Modes:
 """
 
 import asyncio
+from datetime import datetime
 import sys
 import time
 import aiohttp
@@ -16,25 +17,28 @@ from collectors.aaa_collector import fetch_gas_prices
 from strategy.pricing_engine import evaluate_contract, evaluate_satellite_edge
 from strategy.order_manager import OrderManager
 
+# Dynamic date tag generation (e.g. '26SEP28', '26SEP29')
+DATE_TAG = datetime.now().strftime("%y%b%d").upper()
+
 WATCHLIST = {
     "SOFR": {
-        "ticker": "KXSOFR-26SEP28-3.87",
+        "ticker": f"KXSOFR-{DATE_TAG}-3.87",
         "strike": 3.87,
         "type": "exact",
-        "market_ask": 0.50,          # Simulated current resting ask
-        "satellite_budget": 10.00,   # Capped risk budget
+        "market_ask": 0.50,
+        "satellite_budget": 10.00,
         "maker_count": 20
     },
     "GAS_US": {
-        "ticker": "KXGASNAT-26SEP28-T4.4600",
+        "ticker": f"KXGASNAT-{DATE_TAG}-T4.4600",
         "strike": 4.4600,
         "type": "above",
-        "market_ask": 0.42,          # Outlier ask (42c on favored contract)
+        "market_ask": 0.42,
         "satellite_budget": 10.00,
         "maker_count": 15
     },
     "GAS_CA": {
-        "ticker": "KXGASCAL-26SEP28-T6.3700",
+        "ticker": f"KXGASCAL-{DATE_TAG}-T6.3700",
         "strike": 6.3700,
         "type": "above",
         "market_ask": 0.48,
@@ -42,7 +46,7 @@ WATCHLIST = {
         "maker_count": 15
     },
     "WEATHER_MIA": {
-        "ticker": "KXTEMPMIA-26SEP28-T85.0",
+        "ticker": f"KXTEMPMIA-{DATE_TAG}-T85.0",
         "station": "KMIA",
         "strike": 85.0,
         "type": "above",
@@ -92,7 +96,7 @@ def handle_execution(cfg: dict, eval_res: dict, order_mgr: OrderManager):
 
 async def execution_consumer(queue: asyncio.Queue, order_mgr: OrderManager, total_expected: int):
     processed = 0
-    print("\n--- [CORE + SATELLITE PIPELINE ENGAGED] ---")
+    print(f"\n--- [CORE + SATELLITE PIPELINE ENGAGED | ACTIVE DATE: {DATE_TAG}] ---")
 
     while processed < total_expected:
         event = await queue.get()
@@ -134,9 +138,10 @@ async def main():
     if is_live:
         print("[!] =========================================")
         print("[!] WARNING: LIVE EXECUTION MODE (REAL TRADES)")
+        print(f"[!] Target Board Date Tag: {DATE_TAG}")
         print("[!] =========================================")
     else:
-        print("[*] Running in DRY-RUN Mode (Simulation only)")
+        print(f"[*] Running in DRY-RUN Mode (Active Tag: {DATE_TAG})")
         print("[*] (Pass --live to execute real orders)")
 
     event_queue = asyncio.Queue()
