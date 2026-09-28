@@ -1,3 +1,9 @@
 ﻿*.pem
 *.env
 __pycache__/
+
+kalshi_key.pem
+kalshi_key.pem.txt
+.env
+engine_state.json
+__pycache__/
