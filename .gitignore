@@ -7,3 +7,11 @@ kalshi_key.pem.txt
 .env
 engine_state.json
 __pycache__/
+
+*.pem
+*.key
+*.env
+trade_log.csv
+performance_log.csv
+__pycache__/
+
