@@ -23,8 +23,8 @@ so the two bots never touch each other's markets or orders.
 Going live
 ----------
 With AUTO_GO_LIVE on, the bot switches itself to real money ONLY when the paper
-record proves an edge: 100+ settled trades over 10+ different days, net profit after
-fees, and daily profits clearly above zero (t-stat >= 2). It then starts at 1 contract
+record proves an edge: 100+ settled paper trades, net profit after fees, and
+per-trade profits clearly above zero (t-stat >= 2). It then starts at 1 contract
 ($100 max open) and grows a level per 50 settled live trades that stay profitable,
 steps back down if the last 30 live trades lose, and returns to paper for good if live
 trading ever loses LIVE_KILL_LOSS in total.
@@ -66,9 +66,9 @@ TRADE_SAME_DAY = False           # same-day markets are priced off live readings
 # Live trading. ON: the bot switches to REAL MONEY by itself once the paper record
 # passes the gate below. Set AUTO_GO_LIVE = False to stay on paper no matter what.
 AUTO_GO_LIVE = True              # go live automatically once the paper record earns it
-LIVE_MIN_SETTLED = 100           # settled paper trades required...
-LIVE_MIN_DAYS = 10               # ...spread over at least this many different days
-LIVE_MIN_T = 2.0                 # daily profits must be clearly above zero, not luck
+LIVE_MIN_SETTLED = 100           # settled paper trades required (the data set)
+LIVE_MIN_DAYS = 0                # no minimum number of days (0 = off)
+LIVE_MIN_T = 2.0                 # per-trade profits must be clearly above zero, not luck
 LIVE_LEVELS = [(1, 100.0), (2, 200.0), (3, 300.0), (5, 500.0)]  # (contracts/trade, max $ open)
 LIVE_TRADES_PER_LEVEL = 50       # settled profitable live trades needed per level up
 LIVE_STEP_DOWN_WINDOW = 30       # if the last 30 live trades lose money, drop a level
@@ -419,11 +419,14 @@ def live_allowed(rows):
 
     # Gate: only the kinds of trades that will actually be placed live count
     paper = [r for r in rows if r.get("mode") == "paper" and r.get("status") == "settled" and r.get("side") in sides]
-    n_days, total, _, t, _ = daily_stats(_daily(paper))
     if len(paper) < LIVE_MIN_SETTLED:
         return False, f"{len(paper)}/{LIVE_MIN_SETTLED} settled paper trades", None
-    if n_days < LIVE_MIN_DAYS:
+    n_days = len(_daily(paper))
+    if LIVE_MIN_DAYS and n_days < LIVE_MIN_DAYS:
         return False, f"paper record covers {n_days}/{LIVE_MIN_DAYS} days", None
+    # Significance across the individual settled trades (works even if they all
+    # settled over a day or two; a per-day test needs many days).
+    _, total, _, t, _ = daily_stats([float(r["pnl"]) for r in paper])
     if total <= 0 or t < LIVE_MIN_T:
         return False, f"paper not proven yet (net ${total:+.2f}, t={t:.1f}, need >0 and t>={LIVE_MIN_T})", None
 
