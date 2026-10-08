@@ -19,3 +19,7 @@ weather_model_log*.csv
 # Backups from the Oct 8 update
 *.pre-oct8
 patched_oct8/
+
+# Scaler state and account equity history (personal)
+mm_scaler_state.json
+equity_log.csv

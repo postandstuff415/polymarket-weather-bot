@@ -22,9 +22,12 @@ so the two bots never touch each other's markets or orders.
 
 Going live
 ----------
-LIVE_TRADING below is False. Even if you set it to True, the bot refuses to trade
-real money until the paper log has at least LIVE_MIN_SETTLED settled trades AND a
-positive net profit after fees. Live size is capped hard (see LIVE_* settings).
+With AUTO_GO_LIVE on, the bot switches itself to real money ONLY when the paper
+record proves an edge: 100+ settled trades over 10+ different days, net profit after
+fees, and daily profits clearly above zero (t-stat >= 2). It then starts at 1 contract
+($100 max open) and grows a level per 50 settled live trades that stay profitable,
+steps back down if the last 30 live trades lose, and returns to paper for good if live
+trading ever loses LIVE_KILL_LOSS in total.
 """
 
 import argparse
@@ -37,6 +40,7 @@ from datetime import datetime, timedelta, timezone
 import requests
 
 import weather_model as wm
+from scaler import daily_stats
 
 # =============================================================================
 # SETTINGS
@@ -53,10 +57,14 @@ MAX_EDGE = 0.30                  # an "edge" above 30¢ is almost always a data 
 TRADE_SAME_DAY = False           # same-day markets are priced off live readings we can't beat; log only
 
 # Live trading (off). Gate: paper results must earn it first.
-LIVE_TRADING = False
-LIVE_MIN_SETTLED = 100           # settled paper trades required before going live
-LIVE_CONTRACTS = 1               # contracts per live trade
-LIVE_MAX_OPEN_COST = 100.00      # max dollars in open live weather trades
+AUTO_GO_LIVE = True              # go live automatically once the paper record earns it
+LIVE_MIN_SETTLED = 100           # settled paper trades required...
+LIVE_MIN_DAYS = 10               # ...spread over at least this many different days
+LIVE_MIN_T = 2.0                 # daily profits must be clearly above zero, not luck
+LIVE_LEVELS = [(1, 100.0), (2, 200.0), (3, 300.0), (5, 500.0)]  # (contracts/trade, max $ open)
+LIVE_TRADES_PER_LEVEL = 50       # settled profitable live trades needed per level up
+LIVE_STEP_DOWN_WINDOW = 30       # if the last 30 live trades lose money, drop a level
+LIVE_KILL_LOSS = 50.00           # live trading down this much in total -> back to paper for good
 LIVE_ALLOW_NO = False            # NO trades = selling YES you don't own; off until tested
 # =============================================================================
 
@@ -351,7 +359,7 @@ def settle_trades(rows):
         if result not in ("yes", "no"):
             continue
         won = (result == "yes") == (r["side"] == "YES")
-        price, fee, count = float(r["price"]), float(r["fee"]), int(float(r.get("count") or 1))
+        price, fee, count = float(r["price"]), float(r["fee"]), float(r.get("count") or 1)
         r["result"] = result
         r["pnl"] = f"{((1.0 - price) if won else -price) * count - fee:.4f}"
         r["status"] = "settled"
@@ -365,40 +373,86 @@ def paper_summary(rows):
     return len(settled), net
 
 
-# ---- Live (gated) ---------------------------------------------------------------
+def _daily(rows):
+    """Profit per trading day (the market's date), for the significance test."""
+    by_day = {}
+    for r in rows:
+        day = str(r.get("event", "")).split("-")[1] if "-" in str(r.get("event", "")) else r.get("time_utc", "")[:10]
+        by_day[day] = by_day.get(day, 0.0) + float(r["pnl"])
+    return [by_day[d] for d in sorted(by_day)]
+
+
+# ---- Live (gated, automatic) ---------------------------------------------------
 def live_allowed(rows):
-    if not LIVE_TRADING:
-        return False, "LIVE_TRADING is False"
-    n, net = paper_summary(rows)
-    if n < LIVE_MIN_SETTLED:
-        return False, f"only {n}/{LIVE_MIN_SETTLED} settled paper trades"
-    if net <= 0:
-        return False, f"paper net is ${net:.2f} (must be positive)"
-    return True, f"paper record {n} trades, net ${net:+.2f}"
+    """Returns (allowed, reason, (contracts, max_open_cost))."""
+    sides = {"YES", "NO"} if LIVE_ALLOW_NO else {"YES"}
+    if not AUTO_GO_LIVE:
+        return False, "AUTO_GO_LIVE is off", None
+
+    live = [r for r in rows if r.get("mode") == "live" and r.get("status") == "settled"]
+    live_net = sum(float(r["pnl"]) for r in live)
+    if live_net <= -LIVE_KILL_LOSS:
+        return False, f"KILL SWITCH: live trading lost ${-live_net:.2f} (limit ${LIVE_KILL_LOSS:.2f}); paper only", None
+
+    # Gate: only the kinds of trades that will actually be placed live count
+    paper = [r for r in rows if r.get("mode") == "paper" and r.get("status") == "settled" and r.get("side") in sides]
+    n_days, total, _, t, _ = daily_stats(_daily(paper))
+    if len(paper) < LIVE_MIN_SETTLED:
+        return False, f"{len(paper)}/{LIVE_MIN_SETTLED} settled paper trades", None
+    if n_days < LIVE_MIN_DAYS:
+        return False, f"paper record covers {n_days}/{LIVE_MIN_DAYS} days", None
+    if total <= 0 or t < LIVE_MIN_T:
+        return False, f"paper not proven yet (net ${total:+.2f}, t={t:.1f}, need >0 and t>={LIVE_MIN_T})", None
+
+    # Size level from the live record
+    level = 0
+    if live:
+        _, l_total, _, l_t, _ = daily_stats(_daily(live))
+        if l_total > 0 and l_t >= LIVE_MIN_T:
+            level = min(len(LIVE_LEVELS) - 1, len(live) // LIVE_TRADES_PER_LEVEL)
+        recent = live[-LIVE_STEP_DOWN_WINDOW:]
+        if len(recent) >= LIVE_STEP_DOWN_WINDOW and sum(float(r["pnl"]) for r in recent) < 0:
+            level = max(0, level - 1)
+    contracts, cap = LIVE_LEVELS[level]
+    return True, (f"LIVE level {level+1}/{len(LIVE_LEVELS)}: {contracts} contract(s), ${cap:.0f} max open | "
+                  f"paper {len(paper)} trades net ${total:+.2f} t={t:.1f} | live {len(live)} settled net ${live_net:+.2f}"), (contracts, cap)
 
 
-def place_live(trade, rows):
+def place_live(trade, rows, size):
+    """Send a real order. Returns (order_id, filled_count) or None."""
     from strategy.order_manager import OrderManager
+    contracts, cap = size
     if trade["side"] == "NO" and not LIVE_ALLOW_NO:
         return None
-    open_cost = sum(float(r["price"]) * int(float(r.get("count") or 1))
+    open_cost = sum(float(r["price"]) * float(r.get("count") or 1)
                     for r in rows if r.get("mode") == "live" and r.get("status") == "open")
-    if open_cost + float(trade["price"]) * LIVE_CONTRACTS > LIVE_MAX_OPEN_COST:
-        print(f"    [live] skipped: ${open_cost:.2f} already open (cap ${LIVE_MAX_OPEN_COST:.2f})")
+    if open_cost + float(trade["price"]) * contracts > cap:
+        print(f"    [live] skipped: ${open_cost:.2f} already open (cap ${cap:.2f})")
         return None
     om = OrderManager(auth_client=auth(), live=True)
     if trade["side"] == "YES":
         order = {"ticker": trade["ticker"], "side": "bid", "price": float(trade["yes_ask"]),
-                 "count": LIVE_CONTRACTS, "time_in_force": "immediate_or_cancel"}
+                 "count": contracts, "time_in_force": "immediate_or_cancel"}
     else:
         order = {"ticker": trade["ticker"], "side": "ask", "price": float(trade["yes_bid"]),
-                 "count": LIVE_CONTRACTS, "time_in_force": "immediate_or_cancel"}
+                 "count": contracts, "time_in_force": "immediate_or_cancel"}
     res = om.dispatch_order(order)
-    return (res or {}).get("order_id")
+    if not res:
+        return None
+    o = res.get("order", res)
+    filled = o.get("fill_count_fp", o.get("fill_count"))
+    try:
+        filled = float(filled) if filled not in (None, "") else float(contracts)
+    except (TypeError, ValueError):
+        filled = float(contracts)
+    if filled <= 0:
+        print(f"    [live] {trade['ticker']}: order not filled (price moved); kept as paper")
+        return None
+    return o.get("order_id") or res.get("order_id"), filled
 
 
 # ---- One scan -------------------------------------------------------------------
-def scan(rows, live_ok, take_snapshot, verbose=False):
+def scan(rows, live_ok, take_snapshot, verbose=False, live_size=None):
     traded = {r["ticker"] for r in rows}
     signals, snapshots, problems = [], [], []
     now = now_utc()
@@ -484,10 +538,13 @@ def scan(rows, live_ok, take_snapshot, verbose=False):
                     "status": "open", "result": "", "pnl": "", "order_id": ""})
 
     for s in signals:
-        if live_ok:
-            oid = place_live(s, rows)
-            if oid:
-                s["mode"], s["count"], s["order_id"] = "live", LIVE_CONTRACTS, oid
+        if live_ok and live_size:
+            placed = place_live(s, rows, live_size)
+            if placed:
+                oid, filled = placed
+                trade_px = float(s["yes_ask"]) if s["side"] == "YES" else float(s["yes_bid"])
+                s["mode"], s["count"], s["order_id"] = "live", f"{filled:g}", oid
+                s["fee"] = f"{wm.taker_fee(trade_px, max(1, int(round(filled)))):.2f}"
         rows.append(s)
     return signals, snapshots, problems
 
@@ -514,7 +571,8 @@ def main():
     args = ap.parse_args()
 
     print("=" * 64)
-    print("  KALSHI WEATHER BOT  -  " + ("LIVE (gated)" if LIVE_TRADING else "PAPER MODE: no orders are placed"))
+    print("  KALSHI WEATHER BOT  -  " + ("PAPER, goes live automatically once proven" if AUTO_GO_LIVE
+                                           else "PAPER MODE ONLY: no orders are placed"))
     print("=" * 64)
 
     last_snapshot = 0.0
@@ -524,12 +582,11 @@ def main():
         try:
             if settle_trades(rows):
                 save_trades(rows)
-            live_ok, why = live_allowed(rows)
-            if LIVE_TRADING and not live_ok:
-                print(f"[*] Live trading blocked: {why}. Staying in paper mode.")
+            live_ok, why, live_size = live_allowed(rows)
+            print(f"[*] {'LIVE' if live_ok else 'Paper mode'}: {why}")
             take_snap = time.time() - last_snapshot >= SNAPSHOT_EVERY_SECONDS
             print("[*] Scanning cities...", flush=True)
-            signals, snaps, problems = scan(rows, live_ok, take_snap, verbose=first_scan)
+            signals, snaps, problems = scan(rows, live_ok, take_snap, verbose=first_scan, live_size=live_size)
             first_scan = False
             if signals:
                 save_trades(rows)

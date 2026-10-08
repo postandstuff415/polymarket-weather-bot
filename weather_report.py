@@ -60,13 +60,18 @@ def main():
         for k, v in sorted(groups.items(), key=lambda kv: sum(kv[1])):
             print(f"    {k:<28} {len(v):>4} trades   ${sum(v):+8.2f}")
 
-    print("\n  Verdict:")
-    if len(settled) < 100:
-        print(f"    Too early: {len(settled)} settled trades. Wait for 100+ before trusting any of this.")
-    elif sum(pnl) > 0:
-        print("    Profitable on paper after fees. Live trading may be switched on (small size).")
-    else:
-        print("    Not profitable on paper. Do not go live; the model needs work.")
+    live = [r for r in settled if r.get("mode") == "live"]
+    if live:
+        lp = sum(float(r["pnl"]) for r in live)
+        print(f"\n  LIVE trades (real money): {len(live)} settled, net ${lp:+.2f}")
+
+    print("\n  Go-live status (the bot checks this itself every scan):")
+    try:
+        from weather_bot import live_allowed
+        ok, why, _ = live_allowed(rows)
+        print(f"    {'LIVE' if ok else 'Paper'}: {why}")
+    except Exception as e:
+        print(f"    (could not evaluate: {e})")
 
 
 if __name__ == "__main__":

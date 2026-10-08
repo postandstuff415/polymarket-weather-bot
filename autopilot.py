@@ -10,6 +10,7 @@ from strategy.order_manager import OrderManager
 from strategy.reconciler import OrderReconciler
 from strategy.position_manager import PositionManager
 from strategy.risk_governor import RiskGovernor
+from scaler import MarketMakerScaler
 
 # =============================================================================
 # SAFETY SETTINGS (Oct 8 review) - change these on purpose, not by the calendar
@@ -17,7 +18,12 @@ from strategy.risk_governor import RiskGovernor
 # The ladder used to move up a stage automatically every few days, whether the
 # bot was making money or not (Stage 3 = 10x contracts, $900 exposure, on Oct 12).
 # It now stays on the stage below until you change this number yourself.
-MANUAL_STAGE = 2          # 3 contracts per order
+MANUAL_STAGE = 2          # 3 contracts per order (the base the scaler multiplies)
+
+# Automatic scaling (scaler.py): grows size ~1.5x per level ONLY after 7+ days of
+# statistically solid profit at the current level, and steps down on a drawdown.
+# Levels: 3 -> 5 -> 7 -> 10 contracts. Set False to freeze at the base size.
+AUTO_SCALE = True
 
 # Loss stop: if cash + open positions (at cost) drops this far below the
 # starting balance, the bot stops opening new positions (exits keep working).
@@ -90,6 +96,7 @@ auth = KalshiAuth()
 reconciler = OrderReconciler(auth_client=auth, ttl_seconds=ORDER_TTL_SECONDS)
 pos_mgr = PositionManager(auth_client=auth)
 risk = RiskGovernor()
+scaler = MarketMakerScaler(enabled=AUTO_SCALE)
 order_mgr = OrderManager(auth_client=auth, live=True)
 base_url = "https://external-api.kalshi.com/trade-api/v2"
 
@@ -314,6 +321,14 @@ try:
                 can_open = False
                 print(f"[!!] LOSS STOP ACTIVE ({halted_reason}). No new positions; exits only. "
                       f"Restart the bot after reviewing to clear it.")
+
+            # ---- Evidence-based scaling ------------------------------------
+            mult, exposure_cap, scale_status = scaler.update(value_at_cost, tier["max_portfolio_exposure"])
+            print(scale_status)
+            contract_size = max(1, int(round(tier["contract_size"] * mult)))
+            risk.max_contracts_per_market = int(round(tier["max_market_contracts"] * mult))
+            risk.max_dollar_exposure_per_market = tier["max_market_dollars"] * mult
+            risk.max_total_open_exposure = exposure_cap
         else:
             print("[!] Balance unavailable this cycle: no new positions.")
 
