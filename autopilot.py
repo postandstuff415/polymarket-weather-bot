@@ -85,6 +85,7 @@ CSV_FILE = "trade_log.csv"
 TRADABLE_STATUSES = {"active", "open"}
 EXIT_TIME_BUDGET_SECONDS = 5.0     # exits never hold up quoting longer than this per cycle
 closed_tickers = set()             # markets seen closed; they never reopen, so skip forever
+last_exit_price = {}               # ticker -> price of our last exit ask (to avoid undercutting ourselves)
 
 if not os.path.exists(CSV_FILE):
     with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
@@ -266,6 +267,13 @@ def run_inventory_exits(positions: dict, resting_orders: list):
 
             print(f"\n[*] INVENTORY ACTION: Holding {count}x {ticker} (YES)")
             target_ask = exit_price(m_data)
+            # Exits are cancelled every ORDER_TTL_SECONDS and re-posted. If the market
+            # snapshot still shows our own cancelled ask as the best ask, "1¢ under the
+            # ask" undercut ourselves and walked the exit down 1¢ a minute. If the best
+            # ask equals our last exit price, assume it's ours and keep that price.
+            prev = last_exit_price.get(ticker)
+            if target_ask is not None and prev is not None and abs(_price(m_data, "yes_ask") - prev) < 0.005:
+                target_ask = prev
             if target_ask is None:
                 print("    [-] Book is empty (no bid, no ask); not posting an exit this cycle.")
                 continue
@@ -281,6 +289,7 @@ def run_inventory_exits(positions: dict, resting_orders: list):
             if res:
                 oid = res.get("order_id")
                 reconciler.register_order(oid, ticker, "ask", target_ask)
+                last_exit_price[ticker] = target_ask
                 log_trade(ticker, "EXIT_ASK", "ASK", count, target_ask, oid)
             elif order_mgr.last_reject_code == "market_closed":
                 closed_tickers.add(ticker)  # closed between our check and the order
