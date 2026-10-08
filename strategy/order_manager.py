@@ -1,6 +1,13 @@
+import time
 import uuid
 import requests
 from auth import KalshiAuth
+
+# Rejects that are expected during normal running (dust, expired markets).
+# They are logged once per ticker per hour instead of every cycle, and never raise.
+QUIET_REJECTS = {(400, "invalid_order"), (409, "market_closed")}
+QUIET_REJECT_INTERVAL_SECONDS = 3600
+
 
 class OrderManager:
     def __init__(self, auth_client=None, live=False, dry_run=None):
@@ -11,6 +18,8 @@ class OrderManager:
             else "https://external-api.demo.kalshi.co/trade-api/v2"
         )
         self.auth_client = auth_client or KalshiAuth()
+        self.last_reject_code = None      # error code of the most recent reject, e.g. "market_closed"
+        self._last_quiet_log = {}         # (ticker, code) -> time last printed
 
     @staticmethod
     def _parse_dollars(price):
@@ -32,13 +41,23 @@ class OrderManager:
         }
 
     def dispatch_order(self, order_dict: dict):
+        self.last_reject_code = None
         if not order_dict:
             return None
 
         ticker = order_dict.get("ticker")
         target_side = str(order_dict.get("target_side", order_dict.get("side", "bid"))).lower()
         price_dollars = self._parse_dollars(order_dict.get("price", 0.50))
-        count = int(order_dict.get("count", 1))
+
+        # Dust guard: int(0.9) == 0 and Kalshi rejects a 0 count (HTTP 400).
+        # Never send an order for less than one whole contract.
+        try:
+            raw_count = abs(float(order_dict.get("count", 1)))
+        except (TypeError, ValueError):
+            raw_count = 0.0
+        if raw_count < 1.0:
+            return None
+        count = int(raw_count)
         tif = order_dict.get("time_in_force", "good_till_canceled")
 
         # In Kalshi V2 single-book:
@@ -69,6 +88,18 @@ class OrderManager:
                 print(f"[✓] [LIVE V2 ORDER PLACED] {v2_side.upper()} {count}x {ticker} @ ${price_dollars:.4f} (ID: {order_id})")
                 return data
             else:
+                try:
+                    code = (res.json().get("error") or {}).get("code")
+                except ValueError:
+                    code = None
+                self.last_reject_code = code
+                if (res.status_code, code) in QUIET_REJECTS:
+                    key = (ticker, code)
+                    now = time.time()
+                    if now - self._last_quiet_log.get(key, 0) >= QUIET_REJECT_INTERVAL_SECONDS:
+                        print(f"[-] [SKIP] {ticker}: {res.status_code} {code} (repeats muted for 1h)")
+                        self._last_quiet_log[key] = now
+                    return None
                 print(f"[!] [LIVE REJECT] Status {res.status_code}: {res.text}")
                 return None
         except requests.RequestException as e:

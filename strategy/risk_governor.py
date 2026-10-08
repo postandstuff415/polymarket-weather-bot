@@ -33,15 +33,12 @@ class RiskGovernor:
         existing_contracts = abs(pos_data.get("position", 0.0))
         existing_dollar_exposure = pos_data.get("market_exposure", 0.0)
 
-        # 3. Calculate pending exposure from existing resting orders on this ticker
+        # 3. Calculate pending exposure from existing resting BUY orders on this ticker
         pending_contracts = 0
         pending_dollars = 0.0
         for ro in resting_orders:
-            if ro.get("ticker") == ticker:
-                r_count = float(ro.get("remaining_count") or ro.get("count") or 0.0)
-                r_price = float(ro.get("yes_price") or ro.get("price") or 0.50)
-                if r_price > 1.0:
-                    r_price = r_price / 100.0
+            if ro.get("ticker") == ticker and _is_buy(ro):
+                r_count, r_price = _order_size_price(ro)
                 pending_contracts += r_count
                 pending_dollars += (r_count * r_price)
 
@@ -56,9 +53,43 @@ class RiskGovernor:
         if total_projected_dollars > self.max_dollar_exposure_per_market:
             return False, f"Dollar exposure limit reached (${total_projected_dollars:.2f} > ${self.max_dollar_exposure_per_market:.2f})"
 
-        # 6. Check Global Portfolio Exposure Limit
-        total_portfolio_exposure = sum(p.get("market_exposure", 0.0) for p in current_positions.values())
+        # 6. Check Global Portfolio Exposure Limit: held positions AND money tied up in
+        #    resting buy orders (the old check ignored resting orders entirely)
+        held = sum(p.get("market_exposure", 0.0) for p in current_positions.values())
+        resting = 0.0
+        for ro in resting_orders:
+            if _is_buy(ro):
+                r_count, r_price = _order_size_price(ro)
+                resting += r_count * r_price
+        total_portfolio_exposure = held + resting
         if total_portfolio_exposure + (count * price_dollars) > self.max_total_open_exposure:
-            return False, f"Global exposure limit reached (${total_portfolio_exposure:.2f} > ${self.max_total_open_exposure:.2f})"
+            return False, (f"Global exposure limit reached (${held:.2f} held + ${resting:.2f} resting "
+                           f"> ${self.max_total_open_exposure:.2f})")
 
         return True, "Approved"
+
+
+def _is_buy(order: dict) -> bool:
+    """True for orders that add exposure (buy YES). Unknown shapes count as buys (safe side)."""
+    side = str(order.get("side", "")).lower()
+    action = str(order.get("action", "")).lower()
+    if side == "ask" or action == "sell":
+        return False
+    return True
+
+
+def _order_size_price(order: dict):
+    def num(*keys, default=0.0):
+        for k in keys:
+            v = order.get(k)
+            if v not in (None, ""):
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    pass
+        return default
+    count = num("remaining_count_fp", "remaining_count", "count_fp", "count")
+    price = num("price_dollars", "yes_price_dollars", "price", "yes_price", default=0.50)
+    if price > 1.0:
+        price = price / 100.0
+    return count, price

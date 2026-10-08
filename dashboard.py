@@ -103,6 +103,11 @@ engine_active = st.sidebar.toggle("Run Market Making Engine", value=True)
 
 # --- TOP STATUS HEADER ---
 st.title("⚡ Kalshi Market-Making Command Center")
+st.error(
+    "⚠️ NOT YOUR REAL ACCOUNT. Every number on this page is sample data built into "
+    "dashboard.py / engine.py (a simulation). The live bot (autopilot.py) never feeds it. "
+    "For real results run:  python true_pnl.py"
+)
 status_col1, status_col2 = st.columns([3, 1])
 
 with status_col1:

@@ -1,42 +1,40 @@
 import requests
 from auth import KalshiAuth
 
+MAX_PAGES = 20  # pagination safety cap
+
+
 class PositionManager:
     def __init__(self, auth_client=None, base_url="https://external-api.kalshi.com/trade-api/v2"):
         self.auth = auth_client or KalshiAuth()
         self.base_url = base_url
+        self.last_ok = False  # False if the last fetch failed (callers must not trade on {})
 
     def get_all_positions(self) -> dict:
         """
-        Queries Kalshi V2 for active portfolio positions.
-        Uses valid V2 settlement_status filter instead of deprecated query params.
+        All unsettled positions, across every page (the old version read only the
+        first 100, so the bot could forget positions and buy the same market again).
         """
+        self.last_ok = False
         path = "/trade-api/v2/portfolio/positions"
-        headers = self.auth.get_headers("GET", path)
-        params = {
-            "settlement_status": "unsettled",
-            "limit": 100
-        }
-        
+        active_positions = {}
+        cursor = None
         try:
-            res = requests.get(
-                f"{self.base_url}/portfolio/positions",
-                headers=headers,
-                params=params,
-                timeout=10
-            )
-            
-            if res.status_code == 200:
+            for _ in range(MAX_PAGES):
+                params = {"settlement_status": "unsettled", "limit": 200}
+                if cursor:
+                    params["cursor"] = cursor
+                res = requests.get(f"{self.base_url}/portfolio/positions",
+                                   headers=self.auth.get_headers("GET", path), params=params, timeout=10)
+                if res.status_code != 200:
+                    print(f"[!] PositionManager API Status {res.status_code}: {res.text[:200]}")
+                    return {}
                 data = res.json()
                 raw_positions = data.get("market_positions", []) or data.get("positions", [])
-                active_positions = {}
-                
                 for p in raw_positions:
                     ticker = p.get("ticker")
-                    # Handle both float strings and integer representations
                     pos_val = p.get("position_fp") or p.get("position") or 0
                     pos = float(pos_val)
-                    
                     if pos != 0.0:
                         active_positions[ticker] = {
                             "ticker": ticker,
@@ -46,10 +44,11 @@ class PositionManager:
                             "realized_pnl": float(p.get("realized_pnl_dollars") or p.get("realized_pnl") or 0.0),
                             "fees_paid": float(p.get("fees_paid_dollars") or p.get("fees_paid") or 0.0)
                         }
-                return active_positions
-            else:
-                print(f"[!] PositionManager API Status {res.status_code}: {res.text}")
-                return {}
+                cursor = data.get("cursor")
+                if not cursor:
+                    break
+            self.last_ok = True
+            return active_positions
         except Exception as e:
             print(f"[!] PositionManager network error: {e}")
             return {}

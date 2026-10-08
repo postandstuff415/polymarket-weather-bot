@@ -1,0 +1,43 @@
+import logging
+
+logger = logging.getLogger(__name__)
+
+def handle_orchestrator_exit(inventory_service, market_service, execution_client):
+    """
+    Orchestrates the inventory liquidation process with strict validation filters.
+    """
+    # Fix 409: Verify market status is open before executing orders
+    market_info = market_service.fetch_current_status()
+    if market_info.get("status") != "open":
+        logger.warning(f"Market status is currently '{market_info.get('status')}'. Inventory exit halted.")
+        return
+
+    active_positions = inventory_service.get_open_positions()
+
+    for pos in active_positions:
+        ticker = pos.get("ticker")
+        raw_qty = pos.get("quantity", 0)
+
+        try:
+            qty_float = float(raw_qty)
+
+            # Fix 400: Skip sub-contract dust under 1.0 unit
+            if qty_float < 1.0:
+                logger.debug(f"Dust filter triggered for {ticker} ({qty_float}). Skipping.")
+                continue
+
+            # Fix 400: Cast to integer to satisfy the >= 0.01 non-fractional requirement
+            final_qty = int(qty_float)
+
+            execution_client.submit_order(ticker=ticker, qty=final_qty, action="SELL")
+            logger.info(f"Successfully processed exit for {ticker} with quantity {final_qty}")
+
+        # Fix 409: Catch, log, and skip if a market_closed error slips through downstream
+        except Exception as err:
+            err_str = str(err)
+            if "409" in err_str or "market_closed" in err_str:
+                logger.error(f"Skipping {ticker} exit due to 409 market_closed error: {err_str}")
+                continue
+            else:
+                logger.critical(f"Uncaught exception during orchestrator exit for {ticker}: {err_str}")
+                raise err

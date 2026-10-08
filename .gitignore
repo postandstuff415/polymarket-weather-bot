@@ -1,17 +1,21 @@
-﻿*.pem
-*.env
-__pycache__/
-
-kalshi_key.pem
-kalshi_key.pem.txt
+# Secrets - never commit
 .env
-engine_state.json
-__pycache__/
-
+*.env
 *.pem
 *.key
-*.env
-trade_log.csv
-performance_log.csv
+kalshi_key.pem
+kalshi_key.pem.txt
+
+# Python cache
 __pycache__/
 
+# Bot state and logs (change constantly, can be large)
+engine_state.json
+trade_log.csv
+performance_log.csv
+weather_paper_trades*.csv
+weather_model_log*.csv
+
+# Backups from the Oct 8 update
+*.pre-oct8
+patched_oct8/
