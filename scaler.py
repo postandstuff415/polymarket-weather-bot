@@ -131,11 +131,14 @@ class MarketMakerScaler:
             lvl = self._maybe_step_down(lvl, equity, base_exposure, now)
             lvl = self._maybe_step_up(lvl, equity, now)
 
-        mult = self.LEVELS[lvl]
+        # Scaling off means base size, even if a saved state reached a higher level
+        # earlier (it used to keep trading at that saved level's size).
+        mult = self.LEVELS[lvl] if self.enabled else 1.0
         cap = min(base_exposure * mult, self.MAX_EXPOSURE_FRACTION * max(equity, 0.0))
         days_here = (now - self.state["level_since"]) / 86400.0
         n, total, _, t, green = daily_stats(self._daily_pnl_since(self.state["level_since"]))
-        status = (f"[*] Scaler: level {lvl+1}/{len(self.LEVELS)} ({mult:.2f}x) | {days_here:.1f} days here | "
+        level_label = f"level {lvl+1}/{len(self.LEVELS)}" if self.enabled else "base size"
+        status = (f"[*] Scaler: {level_label} ({mult:.2f}x) | {days_here:.1f} days here | "
                   f"{n} full days, net ${total:+,.2f}, t={t:.1f}, green {green:.0%}"
                   + ("" if self.enabled else " | SCALING OFF"))
         return mult, cap, status

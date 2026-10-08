@@ -141,8 +141,8 @@ def main():
     print(f"  Starting balance:                ${start:>10,.2f}")
     print("  " + "-" * 46)
     sign = "+" if true_net >= 0 else "-"
-    print(f"  TRUE NET:                       {sign}${abs(true_net):>10,.2f}"
-          f"   ({true_net / start * 100:+.2f}%)" if start else "")
+    pct = f"   ({true_net / start * 100:+.2f}%)" if start else ""
+    print(f"  TRUE NET:                       {sign}${abs(true_net):>10,.2f}{pct}")
     print(line)
     print("  Breakdown reported by Kalshi (all markets, settled + open):")
     print(f"    Realized P&L:                  ${realized:>10,.2f}")

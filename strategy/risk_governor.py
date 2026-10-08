@@ -71,6 +71,11 @@ class RiskGovernor:
 
 def _is_buy(order: dict) -> bool:
     """True for orders that add exposure (buy YES). Unknown shapes count as buys (safe side)."""
+    # book_side is Kalshi's current field (bid = buy YES, ask = sell YES). side/action
+    # are deprecated and may disappear; they are only a fallback now.
+    book_side = str(order.get("book_side", "")).lower()
+    if book_side in ("bid", "ask"):
+        return book_side == "bid"
     side = str(order.get("side", "")).lower()
     action = str(order.get("action", "")).lower()
     if side == "ask" or action == "sell":

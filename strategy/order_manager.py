@@ -29,7 +29,7 @@ class OrderManager:
                 val = val / 100.0
             return max(0.0100, min(0.9900, round(val, 4)))
         except Exception:
-            return 0.5000
+            return None  # unreadable price: refuse the order (it used to become a 50¢ order)
 
     def build_maker_quote_order(self, ticker, target_side, bid_price, contract_count):
         return {
@@ -47,7 +47,10 @@ class OrderManager:
 
         ticker = order_dict.get("ticker")
         target_side = str(order_dict.get("target_side", order_dict.get("side", "bid"))).lower()
-        price_dollars = self._parse_dollars(order_dict.get("price", 0.50))
+        price_dollars = self._parse_dollars(order_dict.get("price"))
+        if price_dollars is None:
+            print(f"[!] [SKIP] {ticker}: unreadable price {order_dict.get('price')!r}; order not sent.")
+            return None
 
         # Dust guard: int(0.9) == 0 and Kalshi rejects a 0 count (HTTP 400).
         # Never send an order for less than one whole contract.

@@ -120,6 +120,9 @@ class OrderReconciler:
     def reconcile_cycle(self, protected_prefixes=()) -> dict:
         now = time.time()
         remote_orders = self.get_remote_resting_orders()
+        if not self.last_ok:
+            # A failed fetch returns [], which used to wipe all local tracking
+            return {"resting_count": 0, "expired_pruned": 0, "active_ids": []}
         remote_ids = {o.get("order_id"): o for o in remote_orders if o.get("order_id")}
 
         # Clean local registry of orders that no longer exist remotely

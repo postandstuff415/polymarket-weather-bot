@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import traceback
 import csv
 from datetime import datetime, timezone
 
@@ -11,6 +12,14 @@ from strategy.reconciler import OrderReconciler
 from strategy.position_manager import PositionManager
 from strategy.risk_governor import RiskGovernor
 from scaler import MarketMakerScaler
+
+# Windows: if output is redirected to a log file the encoding is cp1252, and printing
+# ✓ ¢ ≥ raised UnicodeEncodeError mid-cycle (even right after a successful cancel).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 # =============================================================================
 # SAFETY SETTINGS (Oct 8 review) - change these on purpose, not by the calendar
@@ -194,11 +203,13 @@ def _price(m: dict, key: str) -> float:
     return v / 100.0 if v > 1.0 else v
 
 
-def exit_price(m_data: dict) -> float:
+def exit_price(m_data: dict):
     """
     Sell price for held YES contracts: 1¢ under the best ask, but never at or below
     the best bid (that would cross the spread and pay taker fees).
     The old code read an empty ask ("0.0000") as 0 and dumped inventory at 5¢.
+    Returns None when the book is completely empty (no bid and no ask): bid + 0.05
+    was then $0.05, which offered the whole position for a nickel.
     """
     bid = _price(m_data, "yes_bid")
     ask = _price(m_data, "yes_ask")
@@ -206,8 +217,10 @@ def exit_price(m_data: dict) -> float:
         target = round(ask - 0.01, 2)
         if target <= bid:
             target = round(ask, 2)          # 1¢-wide book: join the ask instead of crossing
-    else:
+    elif bid > 0.0:
         target = round(bid + 0.05, 2)       # no sellers on the book: rest a little above the bid
+    else:
+        return None                         # empty book: no price to anchor to, try next cycle
     return min(0.99, max(0.02, target))
 
 
@@ -253,6 +266,9 @@ def run_inventory_exits(positions: dict, resting_orders: list):
 
             print(f"\n[*] INVENTORY ACTION: Holding {count}x {ticker} (YES)")
             target_ask = exit_price(m_data)
+            if target_ask is None:
+                print("    [-] Book is empty (no bid, no ask); not posting an exit this cycle.")
+                continue
             print(f"    [*] Posting Exit Ask @ ${target_ask:.2f}...")
             exit_order = {
                 "ticker": ticker,
@@ -278,126 +294,151 @@ def run_inventory_exits(positions: dict, resting_orders: list):
 
 cycle = 1
 active_stage = MANUAL_STAGE
+consecutive_errors = 0
+MAX_CONSECUTIVE_ERRORS = 5
 start_balance = START_BALANCE
 halted_reason = None
 
 try:
     while True:
-        timestamp = time.strftime('%H:%M:%S')
-        tier = LadderManager.get_tier(MANUAL_STAGE)
+        try:
+            timestamp = time.strftime('%H:%M:%S')
+            tier = LadderManager.get_tier(MANUAL_STAGE)
 
-        risk.max_contracts_per_market = tier["max_market_contracts"]
-        risk.max_dollar_exposure_per_market = tier["max_market_dollars"]
-        risk.max_total_open_exposure = tier["max_portfolio_exposure"]
-        contract_size = tier["contract_size"]
+            risk.max_contracts_per_market = tier["max_market_contracts"]
+            risk.max_dollar_exposure_per_market = tier["max_market_dollars"]
+            risk.max_total_open_exposure = tier["max_portfolio_exposure"]
+            contract_size = tier["contract_size"]
 
-        print(f"\n{'='*20} [CYCLE {cycle:04d} | {timestamp} | STAGE {tier['stage']} ({contract_size}x)] {'='*20}")
+            print(f"\n{'='*20} [CYCLE {cycle:04d} | {timestamp} | STAGE {tier['stage']} ({contract_size}x)] {'='*20}")
 
-        # ---- Fail closed: no trading on missing data -------------------------
-        positions = pos_mgr.get_all_positions()
-        rec_status = reconciler.reconcile_cycle(protected_prefixes=WEATHER_PREFIXES)
-        resting_orders = reconciler.get_remote_resting_orders()
-        if not pos_mgr.last_ok or not reconciler.last_ok:
-            print("[!] Could not read positions or open orders from Kalshi. Skipping this cycle (no new orders).")
+            # ---- Fail closed: no trading on missing data -------------------------
+            positions = pos_mgr.get_all_positions()
+            rec_status = reconciler.reconcile_cycle(protected_prefixes=WEATHER_PREFIXES)
+            resting_orders = reconciler.get_remote_resting_orders()
+            if not pos_mgr.last_ok or not reconciler.last_ok:
+                print("[!] Could not read positions or open orders from Kalshi. Skipping this cycle (no new orders).")
+                cycle += 1
+                time.sleep(CYCLE_INTERVAL_SECONDS)
+                continue
+
+            # ---- Real balance + loss stop ---------------------------------------
+            cash = fetch_cash_balance()
+            open_cost = sum(p.get("market_exposure", 0.0) for p in positions.values())
+            can_open = cash is not None
+            if cash is not None:
+                if start_balance is None:
+                    start_balance = cash + open_cost
+                    print(f"[!] START_BALANCE not set; using ${start_balance:,.2f} from this launch as the baseline.")
+                value_at_cost = cash + open_cost
+                drawdown = start_balance - value_at_cost
+                print(f"[*] Cash ${cash:,.2f} + open at cost ${open_cost:,.2f} = ${value_at_cost:,.2f} "
+                      f"| vs start {-drawdown:+,.2f} | loss stop at -{MAX_LOSS_DOLLARS:,.2f}")
+                if drawdown >= MAX_LOSS_DOLLARS and halted_reason is None:
+                    halted_reason = f"loss of ${drawdown:,.2f} reached the ${MAX_LOSS_DOLLARS:,.2f} stop"
+                if halted_reason:
+                    can_open = False
+                    print(f"[!!] LOSS STOP ACTIVE ({halted_reason}). No new positions; exits only. "
+                          f"Restart the bot after reviewing to clear it.")
+
+                # ---- Evidence-based scaling ------------------------------------
+                mult, exposure_cap, scale_status = scaler.update(value_at_cost, tier["max_portfolio_exposure"])
+                print(scale_status)
+                contract_size = max(1, int(round(tier["contract_size"] * mult)))
+                risk.max_contracts_per_market = int(round(tier["max_market_contracts"] * mult))
+                risk.max_dollar_exposure_per_market = tier["max_market_dollars"] * mult
+                risk.max_total_open_exposure = exposure_cap
+            else:
+                print("[!] Balance unavailable this cycle: no new positions.")
+
+            print(f"[*] Orders: {rec_status['resting_count']} active resting | {rec_status['expired_pruned']} stale pruned")
+            print(f"[*] Inventory: {len(positions)} active position(s) held")
+            run_inventory_exits(positions, resting_orders)
+
+            if not can_open:
+                consecutive_errors = 0
+                cycle += 1
+                time.sleep(CYCLE_INTERVAL_SECONDS)
+                continue
+
+            markets = fetch_open_liquid_markets()
+            spread_candidates = [m for m in markets if MIN_SPREAD_CENTS <= m["spread_cents"] <= MAX_SPREAD_CENTS]
+            too_wide = sum(1 for m in markets if m["spread_cents"] > MAX_SPREAD_CENTS)
+            print(f"[*] Discovery: {len(markets)} open books | {len(spread_candidates)} with {MIN_SPREAD_CENTS}-{MAX_SPREAD_CENTS}¢ spreads "
+                  f"| {too_wide} skipped as too thin (>{MAX_SPREAD_CENTS}¢)")
+
+            active_tickers = {ro.get("ticker") for ro in resting_orders}.union(positions.keys())
+            print(f"[*] Active markets: {len(active_tickers)} / {MAX_ACTIVE_MARKETS}")
+            placed_this_cycle = 0
+            skipped_price = skipped_time = 0
+
+            for m in spread_candidates:
+                if placed_this_cycle >= MAX_MARKETS_PER_PASS or len(active_tickers) >= MAX_ACTIVE_MARKETS:
+                    break
+                ticker = m["ticker"]
+                if ticker in active_tickers:
+                    continue
+
+                yes_bid = m["yes_bid"]
+                target_bid = round(yes_bid + 0.01, 2)
+
+                if not (MIN_ENTRY_PRICE <= target_bid <= MAX_ENTRY_PRICE):
+                    skipped_price += 1
+                    continue
+                htc = m["hours_to_close"]
+                if htc is None or htc < MIN_HOURS_TO_CLOSE or htc > MAX_HOURS_TO_CLOSE:
+                    skipped_time += 1
+                    continue
+
+                approved, reason = risk.evaluate_order(
+                    ticker=ticker,
+                    price_dollars=target_bid,
+                    count=contract_size,
+                    current_positions=positions,
+                    resting_orders=resting_orders,
+                    current_balance=cash,
+                )
+
+                if approved:
+                    print(f"\n[+] Placing Maker Quote on {ticker}")
+                    print(f"    Spread: {m['spread_cents']}¢ | Target Bid: {int(round(target_bid*100))}¢ ({contract_size}x) | Closes in {htc:.1f}h")
+                    order = order_mgr.build_maker_quote_order(ticker=ticker, target_side="bid", bid_price=target_bid, contract_count=contract_size)
+                    placed = order_mgr.dispatch_order(order)
+                    if placed:
+                        oid = placed.get("order_id")
+                        reconciler.register_order(oid, ticker, "bid", target_bid)
+                        log_trade(ticker, "ENTRY_BID", "BID", contract_size, target_bid, oid)
+                        active_tickers.add(ticker)
+                        placed_this_cycle += 1
+
+            if skipped_price or skipped_time:
+                print(f"[*] Skipped: {skipped_price} outside {int(MIN_ENTRY_PRICE*100)}-{int(MAX_ENTRY_PRICE*100)}¢ | "
+                      f"{skipped_time} closing within {MIN_HOURS_TO_CLOSE:.0f}h, beyond 7 days, or no close time")
+
+            print(f"\n[✓] Cycle {cycle:04d} complete. Resting {CYCLE_INTERVAL_SECONDS}s before next heartbeat...")
+            consecutive_errors = 0
             cycle += 1
             time.sleep(CYCLE_INTERVAL_SECONDS)
-            continue
-
-        # ---- Real balance + loss stop ---------------------------------------
-        cash = fetch_cash_balance()
-        open_cost = sum(p.get("market_exposure", 0.0) for p in positions.values())
-        can_open = cash is not None
-        if cash is not None:
-            if start_balance is None:
-                start_balance = cash + open_cost
-                print(f"[!] START_BALANCE not set; using ${start_balance:,.2f} from this launch as the baseline.")
-            value_at_cost = cash + open_cost
-            drawdown = start_balance - value_at_cost
-            print(f"[*] Cash ${cash:,.2f} + open at cost ${open_cost:,.2f} = ${value_at_cost:,.2f} "
-                  f"| vs start {-drawdown:+,.2f} | loss stop at -{MAX_LOSS_DOLLARS:,.2f}")
-            if drawdown >= MAX_LOSS_DOLLARS and halted_reason is None:
-                halted_reason = f"loss of ${drawdown:,.2f} reached the ${MAX_LOSS_DOLLARS:,.2f} stop"
-            if halted_reason:
-                can_open = False
-                print(f"[!!] LOSS STOP ACTIVE ({halted_reason}). No new positions; exits only. "
-                      f"Restart the bot after reviewing to clear it.")
-
-            # ---- Evidence-based scaling ------------------------------------
-            mult, exposure_cap, scale_status = scaler.update(value_at_cost, tier["max_portfolio_exposure"])
-            print(scale_status)
-            contract_size = max(1, int(round(tier["contract_size"] * mult)))
-            risk.max_contracts_per_market = int(round(tier["max_market_contracts"] * mult))
-            risk.max_dollar_exposure_per_market = tier["max_market_dollars"] * mult
-            risk.max_total_open_exposure = exposure_cap
-        else:
-            print("[!] Balance unavailable this cycle: no new positions.")
-
-        print(f"[*] Orders: {rec_status['resting_count']} active resting | {rec_status['expired_pruned']} stale pruned")
-        print(f"[*] Inventory: {len(positions)} active position(s) held")
-        run_inventory_exits(positions, resting_orders)
-
-        if not can_open:
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            # One unexpected error used to kill the process (the watchdog restarts it,
+            # but a repeating bug crash-looped every 5s). Log it and try the next cycle;
+            # after several failures in a row, cancel quotes and exit so nothing is left
+            # resting unmanaged.
+            consecutive_errors += 1
+            print(f"\n[!!] Cycle {cycle:04d} crashed ({consecutive_errors}/{MAX_CONSECUTIVE_ERRORS} in a row):")
+            traceback.print_exc()
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                print(f"[!!] {MAX_CONSECUTIVE_ERRORS} cycles in a row failed. Cancelling resting quotes and exiting.")
+                try:
+                    cleared = reconciler.cancel_all_resting(protected_prefixes=WEATHER_PREFIXES)
+                    print(f"[✓] Cancelled {cleared} resting order(s).")
+                except Exception as e:
+                    print(f"[!!] Could not cancel resting orders ({e}). CHECK KALSHI AND CANCEL THEM BY HAND.")
+                sys.exit(1)
             cycle += 1
             time.sleep(CYCLE_INTERVAL_SECONDS)
-            continue
-
-        markets = fetch_open_liquid_markets()
-        spread_candidates = [m for m in markets if MIN_SPREAD_CENTS <= m["spread_cents"] <= MAX_SPREAD_CENTS]
-        too_wide = sum(1 for m in markets if m["spread_cents"] > MAX_SPREAD_CENTS)
-        print(f"[*] Discovery: {len(markets)} open books | {len(spread_candidates)} with {MIN_SPREAD_CENTS}-{MAX_SPREAD_CENTS}¢ spreads "
-              f"| {too_wide} skipped as too thin (>{MAX_SPREAD_CENTS}¢)")
-
-        active_tickers = {ro.get("ticker") for ro in resting_orders}.union(positions.keys())
-        print(f"[*] Active markets: {len(active_tickers)} / {MAX_ACTIVE_MARKETS}")
-        placed_this_cycle = 0
-        skipped_price = skipped_time = 0
-
-        for m in spread_candidates:
-            if placed_this_cycle >= MAX_MARKETS_PER_PASS or len(active_tickers) >= MAX_ACTIVE_MARKETS:
-                break
-            ticker = m["ticker"]
-            if ticker in active_tickers:
-                continue
-
-            yes_bid = m["yes_bid"]
-            target_bid = round(yes_bid + 0.01, 2)
-
-            if not (MIN_ENTRY_PRICE <= target_bid <= MAX_ENTRY_PRICE):
-                skipped_price += 1
-                continue
-            htc = m["hours_to_close"]
-            if htc is None or htc < MIN_HOURS_TO_CLOSE or htc > MAX_HOURS_TO_CLOSE:
-                skipped_time += 1
-                continue
-
-            approved, reason = risk.evaluate_order(
-                ticker=ticker,
-                price_dollars=target_bid,
-                count=contract_size,
-                current_positions=positions,
-                resting_orders=resting_orders,
-                current_balance=cash,
-            )
-
-            if approved:
-                print(f"\n[+] Placing Maker Quote on {ticker}")
-                print(f"    Spread: {m['spread_cents']}¢ | Target Bid: {int(round(target_bid*100))}¢ ({contract_size}x) | Closes in {htc:.1f}h")
-                order = order_mgr.build_maker_quote_order(ticker=ticker, target_side="bid", bid_price=target_bid, contract_count=contract_size)
-                placed = order_mgr.dispatch_order(order)
-                if placed:
-                    oid = placed.get("order_id")
-                    reconciler.register_order(oid, ticker, "bid", target_bid)
-                    log_trade(ticker, "ENTRY_BID", "BID", contract_size, target_bid, oid)
-                    active_tickers.add(ticker)
-                    placed_this_cycle += 1
-
-        if skipped_price or skipped_time:
-            print(f"[*] Skipped: {skipped_price} outside {int(MIN_ENTRY_PRICE*100)}-{int(MAX_ENTRY_PRICE*100)}¢ | "
-                  f"{skipped_time} closing within {MIN_HOURS_TO_CLOSE:.0f}h, beyond 7 days, or no close time")
-
-        print(f"\n[✓] Cycle {cycle:04d} complete. Resting {CYCLE_INTERVAL_SECONDS}s before next heartbeat...")
-        cycle += 1
-        time.sleep(CYCLE_INTERVAL_SECONDS)
 
 except KeyboardInterrupt:
     print("\n\n" + "=" * 65)
