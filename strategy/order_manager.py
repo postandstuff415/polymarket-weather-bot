@@ -1,7 +1,16 @@
 import time
 import uuid
+import sys
 import requests
 from auth import KalshiAuth
+
+# The "✓" printed right AFTER a successful order raised UnicodeEncodeError on a cp1252
+# Windows console/log, so a real, placed order was reported to the caller as failed.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 # Rejects that are expected during normal running (dust, expired markets).
 # They are logged once per ticker per hour instead of every cycle, and never raise.
@@ -80,6 +89,12 @@ class OrderManager:
             "self_trade_prevention_type": "taker_at_cross",
             "client_order_id": str(uuid.uuid4())
         }
+        if tif == "good_till_canceled":
+            # Resting quotes must stay maker: if the book moved since we read it, Kalshi
+            # rejects the order instead of filling it as a taker (and charging taker fees).
+            payload["post_only"] = True
+            # ...and pulls them automatically if the exchange pauses trading.
+            payload["cancel_order_on_pause"] = True
 
         headers = self.auth_client.get_headers(method="POST", path=sign_path)
 

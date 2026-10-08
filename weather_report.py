@@ -23,15 +23,18 @@ def main():
         return
     with open(TRADES_CSV, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
-    settled = [r for r in rows if r.get("status") == "settled"]
+    # Paper only: live trades (real money, different sizes) are reported separately
+    # below; they used to be mixed into the paper totals and calibration.
+    settled = [r for r in rows if r.get("status") == "settled" and r.get("mode", "paper") == "paper"]
     open_rows = [r for r in rows if r.get("status") == "open"]
+    live = [r for r in rows if r.get("status") == "settled" and r.get("mode") == "live"]
 
     print("=" * 60)
     print("  WEATHER BOT - PAPER RESULTS")
     print("=" * 60)
     print(f"  Trades recorded: {len(rows)}  |  settled: {len(settled)}  |  waiting: {len(open_rows)}")
     if not settled:
-        print("  Nothing has settled yet. Daily markets settle the morning after.")
+        print("  No paper trades have settled yet. Daily markets settle the morning after.")
         return
 
     pnl = [float(r["pnl"]) for r in settled]
@@ -60,7 +63,6 @@ def main():
         for k, v in sorted(groups.items(), key=lambda kv: sum(kv[1])):
             print(f"    {k:<28} {len(v):>4} trades   ${sum(v):+8.2f}")
 
-    live = [r for r in settled if r.get("mode") == "live"]
     if live:
         lp = sum(float(r["pnl"]) for r in live)
         print(f"\n  LIVE trades (real money): {len(live)} settled, net ${lp:+.2f}")

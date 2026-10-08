@@ -42,6 +42,13 @@ import requests
 import weather_model as wm
 from scaler import daily_stats
 
+# Windows: keep ¢ / °F prints from raising UnicodeEncodeError when output is redirected
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # =============================================================================
 # SETTINGS
 # =============================================================================
@@ -56,7 +63,8 @@ MAX_CENTER_GAP_F = 2.0           # model and market more than 2°F apart = likel
 MAX_EDGE = 0.30                  # an "edge" above 30¢ is almost always a data problem, not an opportunity
 TRADE_SAME_DAY = False           # same-day markets are priced off live readings we can't beat; log only
 
-# Live trading (off). Gate: paper results must earn it first.
+# Live trading. ON: the bot switches to REAL MONEY by itself once the paper record
+# passes the gate below. Set AUTO_GO_LIVE = False to stay on paper no matter what.
 AUTO_GO_LIVE = True              # go live automatically once the paper record earns it
 LIVE_MIN_SETTLED = 100           # settled paper trades required...
 LIVE_MIN_DAYS = 10               # ...spread over at least this many different days
@@ -318,11 +326,18 @@ def market_center_f(ms):
 
 
 # ---- Trade log ----------------------------------------------------------------
+_unsaved_live = {}   # ticker -> live trade row placed but not yet written to TRADES_CSV
+
+
 def load_trades():
-    if not os.path.exists(TRADES_CSV):
-        return []
-    with open(TRADES_CSV, newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
+    rows = []
+    if os.path.exists(TRADES_CSV):
+        with open(TRADES_CSV, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    # Real orders whose save failed are kept in memory so they're never placed twice
+    on_file = {r.get("ticker") for r in rows}
+    rows.extend(r for t, r in _unsaved_live.items() if t not in on_file)
+    return rows
 
 
 def save_trades(rows):
@@ -333,6 +348,9 @@ def save_trades(rows):
         for r in rows:
             w.writerow({k: r.get(k, "") for k in TRADE_FIELDS})
     os.replace(tmp, TRADES_CSV)
+    saved = {r.get("ticker") for r in rows}
+    for t in [t for t in _unsaved_live if t in saved]:
+        del _unsaved_live[t]
 
 
 def append_snapshots(rows):
@@ -354,7 +372,12 @@ def settle_trades(rows):
         try:
             m = kalshi_get(f"/markets/{r['ticker']}").get("market", {})
         except Exception:
-            continue
+            # Old markets move to the historical database; without this fallback their
+            # trades stayed "open" forever (and kept counting against the live cap).
+            try:
+                m = kalshi_get(f"/historical/markets/{r['ticker']}").get("market", {})
+            except Exception:
+                continue
         result = str(m.get("result") or "").lower()
         if result not in ("yes", "no"):
             continue
@@ -545,6 +568,18 @@ def scan(rows, live_ok, take_snapshot, verbose=False, live_size=None):
                 trade_px = float(s["yes_ask"]) if s["side"] == "YES" else float(s["yes_bid"])
                 s["mode"], s["count"], s["order_id"] = "live", f"{filled:g}", oid
                 s["fee"] = f"{wm.taker_fee(trade_px, max(1, int(round(filled)))):.2f}"
+                rows.append(s)
+                _unsaved_live[s["ticker"]] = s
+                # Record every real order the moment it fills. If the file can't be
+                # written (e.g. open in Excel) the order was forgotten and re-placed every
+                # scan. Now: stop placing live orders until the record is safe.
+                try:
+                    save_trades(rows)
+                except Exception as e:
+                    print(f"[!!] LIVE ORDER {oid} on {s['ticker']} could not be saved to {TRADES_CSV} ({e}). "
+                          f"Live trading paused for this scan. Close the file if it is open in Excel.")
+                    live_ok = False
+                continue
         rows.append(s)
     return signals, snapshots, problems
 
@@ -578,11 +613,19 @@ def main():
     last_snapshot = 0.0
     first_scan = True
     while True:
-        rows = load_trades()
         try:
+            # Inside the try: a locked/unreadable CSV used to crash the bot for good
+            # (run_weather.bat does not restart it).
+            rows = load_trades()
             if settle_trades(rows):
                 save_trades(rows)
             live_ok, why, live_size = live_allowed(rows)
+            if live_ok:
+                # Never place real orders unless the trade record can be written.
+                try:
+                    save_trades(rows)
+                except Exception as e:
+                    live_ok, why = False, f"live paused: cannot write {TRADES_CSV} ({e}); close it if open in Excel"
             print(f"[*] {'LIVE' if live_ok else 'Paper mode'}: {why}")
             take_snap = time.time() - last_snapshot >= SNAPSHOT_EVERY_SECONDS
             print("[*] Scanning cities...", flush=True)
