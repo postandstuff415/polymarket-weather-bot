@@ -22,12 +22,14 @@ so the two bots never touch each other's markets or orders.
 
 Going live
 ----------
-With AUTO_GO_LIVE on, the bot switches itself to real money ONLY when the paper
-record proves an edge: 100+ settled paper trades, net profit after fees, and
-per-trade profits clearly above zero (t-stat >= 2). It then starts at 1 contract
-($100 max open) and grows a level per 50 settled live trades that stay profitable,
-steps back down if the last 30 live trades lose, and returns to paper for good if live
-trading ever loses LIVE_KILL_LOSS in total.
+With AUTO_GO_LIVE on, the bot switches itself to real money once 100 paper trades
+have settled (a data set; no profit requirement). Then:
+  * LIVE TEST: the first 100 live trades run at 1 contract ($100 max open). After
+    the 100th is placed, no more live trades until all 100 settle. If they didn't
+    make a profit after fees, live trading stops for good and the bot returns to paper.
+  * If the test passes, size goes up one level, then one more per 50 settled live
+    trades while still profitable, and steps back down if the last 30 live trades lose.
+  * At any time, live losses totalling LIVE_KILL_LOSS stop live trading for good.
 """
 
 import argparse
@@ -66,9 +68,10 @@ TRADE_SAME_DAY = False           # same-day markets are priced off live readings
 # Live trading. ON: the bot switches to REAL MONEY by itself once the paper record
 # passes the gate below. Set AUTO_GO_LIVE = False to stay on paper no matter what.
 AUTO_GO_LIVE = True              # go live automatically once the paper record earns it
-LIVE_MIN_SETTLED = 100           # settled paper trades required (the data set)
-LIVE_MIN_DAYS = 0                # no minimum number of days (0 = off)
-LIVE_MIN_T = 2.0                 # per-trade profits must be clearly above zero, not luck
+LIVE_MIN_SETTLED = 100           # settled paper trades required before going live (no profit test)
+LIVE_TEST_TRADES = 100           # live test: the first 100 live trades run at the smallest size...
+                                 # ...and if they aren't profitable after fees, live stops for good
+LIVE_MIN_T = 2.0                 # live per-day profits must be clearly above zero to size up
 LIVE_LEVELS = [(1, 100.0), (2, 200.0), (3, 300.0), (5, 500.0)]  # (contracts/trade, max $ open)
 LIVE_TRADES_PER_LEVEL = 50       # settled profitable live trades needed per level up
 LIVE_STEP_DOWN_WINDOW = 30       # if the last 30 live trades lose money, drop a level
@@ -417,31 +420,47 @@ def live_allowed(rows):
     if live_net <= -LIVE_KILL_LOSS:
         return False, f"KILL SWITCH: live trading lost ${-live_net:.2f} (limit ${LIVE_KILL_LOSS:.2f}); paper only", None
 
-    # Gate: only the kinds of trades that will actually be placed live count
+    # Live test: the first LIVE_TEST_TRADES live trades PLACED (file order). No live
+    # trade beyond them is placed until all of them have settled; then they must have
+    # made money after fees, or live trading is off for good. The same trades always
+    # decide it, so the verdict can't flip later.
+    test = [r for r in rows if r.get("mode") == "live"][:LIVE_TEST_TRADES]
+    test_settled = [r for r in test if r.get("status") == "settled"]
+    test_net = sum(float(r["pnl"]) for r in test_settled)
+    test_done = len(test) >= LIVE_TEST_TRADES and len(test_settled) == len(test)
+    if len(test) >= LIVE_TEST_TRADES and not test_done:
+        return False, (f"live test: all {LIVE_TEST_TRADES} trades placed, {len(test_settled)} settled "
+                       f"(net ${test_net:+.2f} so far); no new live trades until the verdict"), None
+    if test_done and test_net <= 0:
+        return False, (f"LIVE TEST FAILED: first {LIVE_TEST_TRADES} live trades net ${test_net:+.2f} "
+                       f"after fees; paper only"), None
+
+    # Go-live gate: a data set of settled paper trades (no profit requirement).
+    # Only the kinds of trades that will actually be placed live count.
     paper = [r for r in rows if r.get("mode") == "paper" and r.get("status") == "settled" and r.get("side") in sides]
+    paper_net = sum(float(r["pnl"]) for r in paper)
     if len(paper) < LIVE_MIN_SETTLED:
         return False, f"{len(paper)}/{LIVE_MIN_SETTLED} settled paper trades", None
-    n_days = len(_daily(paper))
-    if LIVE_MIN_DAYS and n_days < LIVE_MIN_DAYS:
-        return False, f"paper record covers {n_days}/{LIVE_MIN_DAYS} days", None
-    # Significance across the individual settled trades (works even if they all
-    # settled over a day or two; a per-day test needs many days).
-    _, total, _, t, _ = daily_stats([float(r["pnl"]) for r in paper])
-    if total <= 0 or t < LIVE_MIN_T:
-        return False, f"paper not proven yet (net ${total:+.2f}, t={t:.1f}, need >0 and t>={LIVE_MIN_T})", None
 
-    # Size level from the live record
+    # Size level from the live record; locked at the smallest size during the test
     level = 0
-    if live:
+    if test_done:
+        # Passing the test earns one step; then one more per 50 settled live trades,
+        # while the live record stays clearly profitable.
+        level = 1
         _, l_total, _, l_t, _ = daily_stats(_daily(live))
         if l_total > 0 and l_t >= LIVE_MIN_T:
-            level = min(len(LIVE_LEVELS) - 1, len(live) // LIVE_TRADES_PER_LEVEL)
+            level += (len(live) - LIVE_TEST_TRADES) // LIVE_TRADES_PER_LEVEL
+        level = min(len(LIVE_LEVELS) - 1, level)
         recent = live[-LIVE_STEP_DOWN_WINDOW:]
         if len(recent) >= LIVE_STEP_DOWN_WINDOW and sum(float(r["pnl"]) for r in recent) < 0:
             level = max(0, level - 1)
     contracts, cap = LIVE_LEVELS[level]
+    phase = (f"live test PASSED (${test_net:+.2f})" if test_done else
+             f"live test {len(test)}/{LIVE_TEST_TRADES} placed, {len(test_settled)} settled, net ${test_net:+.2f}")
     return True, (f"LIVE level {level+1}/{len(LIVE_LEVELS)}: {contracts} contract(s), ${cap:.0f} max open | "
-                  f"paper {len(paper)} trades net ${total:+.2f} t={t:.1f} | live {len(live)} settled net ${live_net:+.2f}"), (contracts, cap)
+                  f"{phase} | paper {len(paper)} trades net ${paper_net:+.2f} | "
+                  f"live {len(live)} settled net ${live_net:+.2f}"), (contracts, cap)
 
 
 def place_live(trade, rows, size):
@@ -449,6 +468,12 @@ def place_live(trade, rows, size):
     from strategy.order_manager import OrderManager
     contracts, cap = size
     if trade["side"] == "NO" and not LIVE_ALLOW_NO:
+        return None
+    # Live test cap, checked per order (one scan can produce several trades)
+    live_rows = [r for r in rows if r.get("mode") == "live"]
+    test_open = any(r.get("status") != "settled" for r in live_rows[:LIVE_TEST_TRADES])
+    if len(live_rows) >= LIVE_TEST_TRADES and test_open:
+        print(f"    [live] skipped: live test is at {LIVE_TEST_TRADES} trades; waiting for them to settle")
         return None
     open_cost = sum(float(r["price"]) * float(r.get("count") or 1)
                     for r in rows if r.get("mode") == "live" and r.get("status") == "open")
