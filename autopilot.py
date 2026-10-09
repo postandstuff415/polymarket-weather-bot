@@ -51,6 +51,12 @@ MIN_HOURS_TO_CLOSE = 6.0
 # caught in-play games, where prices jump on every play and our bids get picked off.
 # Uses Kalshi's occurrence_datetime (game start); markets without one are unaffected.
 MIN_HOURS_BEFORE_EVENT = 3.0
+# Only open positions in game lines: series ending in SPREAD, TOTAL (incl. team totals) or
+# GAME. pnl_report.py (Oct 2-9): game lines bought 3h+ ahead +$3.85 over 152 markets;
+# everything else bought 3h+ ahead -$12.68 over 200 (player props, hourly markets...).
+# Set False to trade every market type again. Exits on held positions are unaffected.
+GAME_LINES_ONLY = True
+ALLOWED_SERIES_SUFFIXES = ("SPREAD", "TOTAL", "GAME")
 # ...and never in markets that close more than 7 days out (no long bets)
 MAX_HOURS_TO_CLOSE = 168.0
 # Spread risk across at most this many markets at once (positions + open orders)
@@ -138,6 +144,13 @@ def fetch_cash_balance():
     except Exception as e:
         print(f"[!] Balance network error: {e}")
         return None
+
+
+def is_allowed_market_type(ticker: str) -> bool:
+    """Game lines only (see GAME_LINES_ONLY): KXNFLSPREAD-..., KXNBATOTAL-..., KXCS2GAME-..."""
+    if not GAME_LINES_ONLY:
+        return True
+    return ticker.split("-")[0].upper().endswith(ALLOWED_SERIES_SUFFIXES)
 
 
 def hours_until(raw):
@@ -398,13 +411,16 @@ try:
             active_tickers = {ro.get("ticker") for ro in resting_orders}.union(positions.keys())
             print(f"[*] Active markets: {len(active_tickers)} / {MAX_ACTIVE_MARKETS}")
             placed_this_cycle = 0
-            skipped_price = skipped_time = skipped_live = 0
+            skipped_price = skipped_time = skipped_live = skipped_type = 0
 
             for m in spread_candidates:
                 if placed_this_cycle >= MAX_MARKETS_PER_PASS or len(active_tickers) >= MAX_ACTIVE_MARKETS:
                     break
                 ticker = m["ticker"]
                 if ticker in active_tickers:
+                    continue
+                if not is_allowed_market_type(ticker):
+                    skipped_type += 1
                     continue
 
                 yes_bid = m["yes_bid"]
@@ -443,6 +459,8 @@ try:
                         active_tickers.add(ticker)
                         placed_this_cycle += 1
 
+            if skipped_type:
+                print(f"[*] Skipped {skipped_type} market(s) that aren't game lines (player props, hourly, etc.)")
             if skipped_price or skipped_time or skipped_live:
                 print(f"[*] Skipped: {skipped_price} outside {int(MIN_ENTRY_PRICE*100)}-{int(MAX_ENTRY_PRICE*100)}¢ | "
                       f"{skipped_time} closing within {MIN_HOURS_TO_CLOSE:.0f}h, beyond 7 days, or no close time | "
