@@ -41,6 +41,13 @@ Needs POLYMARKET_KEY_ID and POLYMARKET_SECRET_KEY in a .env file next to this sc
   * live test: after the first LIVE_TEST_TRADES live trades settle, if they didn't
     make money after fees, live stops for good
 Signals that can't go live (caps, no fill, kill switch) are still logged as paper.
+
+Early-exit monitor (log only)
+-----------------------------
+Every scan re-prices each open live bet with the latest forecast. If selling at the current
+bid would pay at least EXIT_MIN_EDGE per contract more (after the fee) than the model says the
+bet is worth, that is logged to polymarket_exit_log.csv. Nothing is sold: the log shows, once
+bets settle, whether selling early would have beaten holding.
 """
 
 import argparse
@@ -86,6 +93,10 @@ LIVE_YES_LONGSHOT_EXTRA_EDGE = 0.03  # ...needs this much more than MIN_EDGE
 LIVE_KILL_LOSS = 40.00           # settled live trades down this much -> live stops for good
 LIVE_TEST_TRADES = 30            # once this many live trades settle, they must be net positive...
                                  # ...or live stops for good
+
+# Early-exit monitor (only with --live; logs, never sells). See above.
+EXIT_MONITOR = True
+EXIT_MIN_EDGE = 0.03             # flag a bet when selling beats holding by 3¢+ per contract after the fee
 # =============================================================================
 
 GATEWAY = "https://gateway.polymarket.us/v1"   # public market data, no key needed
@@ -98,6 +109,9 @@ STATIONS = {st: (offset, name) for st, offset, name in wm.CITIES.values()}
 
 TRADES_CSV = "polymarket_paper_trades.csv"
 SNAPSHOT_CSV = "polymarket_model_log.csv"
+EXIT_LOG_CSV = "polymarket_exit_log.csv"
+EXIT_LOG_FIELDS = ["time_utc", "market", "side", "count", "entry_price", "sell_price", "sell_net",
+                   "model_value", "edge", "pnl_if_sold"]
 TRADE_FIELDS = ["time_utc", "mode", "market", "event", "city", "station", "bracket", "side", "price",
                 "fee", "count", "model_win_prob", "edge", "yes_bid", "yes_ask", "model_center_f",
                 "obs_max_f", "future_max_f", "status", "result", "pnl", "order_id", "fill_px_raw"]
@@ -518,11 +532,58 @@ def check_live():
     print("No open temperature market with a two-sided book found to preview.")
 
 
+# ---- Early-exit monitor (log only) -------------------------------------------------------
+def exit_signal(side, p_yes, yes_bid, yes_ask, rate):
+    """(sell_price, net_per_contract, model_value) if selling beats holding by EXIT_MIN_EDGE, else None.
+    Prices are for the side held: a NO sells for 1 - YES ask."""
+    px, value = (yes_bid, p_yes) if side == "YES" else (round(1.0 - yes_ask, 4), 1.0 - p_yes)
+    if not 0.01 <= px <= 0.99:
+        return None   # no buyer at a real price
+    net = px - taker_fee(px, rate)
+    if net - value < EXIT_MIN_EDGE:
+        return None
+    return px, net, value
+
+
+def monitor_exits(rows, marks, client):
+    """Log open live bets the market now pays more for than the model thinks they're worth."""
+    try:
+        positions = client.portfolio.positions().get("positions") or {}
+    except Exception as e:
+        print(f"[!] Exit monitor skipped this scan: couldn't read positions ({e})")
+        return
+    flagged = []
+    for row in [r for r in rows if r.get("mode") == "live" and r.get("status") == "open"]:
+        mark = marks.get(row["market"])
+        if not mark or not mark["open"] or not mark["gap_ok"]:
+            continue   # closed market or untrustworthy model
+        held = abs(float((positions.get(row["market"]) or {}).get("qtyAvailable") or 0))
+        qty = int(min(float(row.get("count") or 0), held))
+        sig = exit_signal(row["side"], mark["p_yes"], mark["bid"], mark["ask"], mark["rate"])
+        if qty < 1 or not sig:
+            continue
+        px, net, value = sig
+        pnl = (net - float(row["price"])) * qty
+        print(f"    [exit monitor] would sell {row['side']} {qty}x {row['market']} @ ${px:.2f} "
+              f"(model says ${value:.2f}, bought ${float(row['price']):.2f}, P&L if sold ${pnl:+.2f})")
+        flagged.append({"time_utc": now_utc().isoformat(), "market": row["market"], "side": row["side"],
+                        "count": qty, "entry_price": row["price"], "sell_price": f"{px:.4f}",
+                        "sell_net": f"{net:.4f}", "model_value": f"{value:.4f}",
+                        "edge": f"{net - value:.4f}", "pnl_if_sold": f"{pnl:.4f}"})
+    if flagged:
+        new = not os.path.exists(EXIT_LOG_CSV)
+        with open(EXIT_LOG_CSV, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=EXIT_LOG_FIELDS)
+            if new:
+                w.writeheader()
+            w.writerows(flagged)
+
+
 # ---- One scan -------------------------------------------------------------------------
 def scan(rows, take_snapshot, verbose=False):
     traded = {r["market"] for r in rows}
     signals, snapshots, problems = [], [], []
-    events = {}
+    events, marks = {}, {}   # marks: market -> latest model price and quotes, for the exit monitor
     now = now_utc()
     today = now.date()
     days = [today + timedelta(days=d) for d in range(-1, DAYS_AHEAD + 1)]
@@ -586,6 +647,9 @@ def scan(rows, take_snapshot, verbose=False):
             for b, p in zip(brackets, probs):
                 m, bid, ask = b["m"], b["bid"], b["ask"]
                 label = bracket_label(b["lo"], b["hi"])
+                rate = float(m.get("feeCoefficient") or DEFAULT_FEE_RATE)
+                marks[m["slug"]] = {"p_yes": p, "bid": bid, "ask": ask, "rate": rate,
+                                    "open": b["open"], "gap_ok": gap_ok}
                 if take_snapshot:
                     snapshots.append({"time_utc": now.isoformat(), "market": m["slug"], "bracket": label,
                                       "model_p_yes": f"{p:.4f}", "yes_bid": bid, "yes_ask": ask,
@@ -594,7 +658,6 @@ def scan(rows, take_snapshot, verbose=False):
                                       "future_max_f": "" if fut is None else f"{fut:.1f}"})
                 if m["slug"] in traded or not b["open"] or not gap_ok or not tradable_day:
                     continue
-                rate = float(m.get("feeCoefficient") or DEFAULT_FEE_RATE)
                 best = best_trade(p, bid, ask, rate)
                 if not best:
                     continue
@@ -614,7 +677,7 @@ def scan(rows, take_snapshot, verbose=False):
             print(f"  [{i:>2}/{len(codes)}] {code:<5} {found} open event(s)", flush=True)
 
     rows.extend(signals)
-    return signals, snapshots, problems, events
+    return signals, snapshots, problems, events, marks
 
 
 def print_cycle(signals, problems, rows):
@@ -669,9 +732,11 @@ def main():
             rows = load_trades()
             take_snap = time.time() - last_snapshot >= SNAPSHOT_EVERY_SECONDS
             print("[*] Scanning Polymarket US temperature markets...", flush=True)
-            signals, snaps, problems, events = scan(rows, take_snap, verbose=first_scan)
+            signals, snaps, problems, events, marks = scan(rows, take_snap, verbose=first_scan)
             first_scan = False
             settled_now = settle_trades(rows, events)
+            if client is not None and EXIT_MONITOR:
+                monitor_exits(rows, marks, client)
             if client is not None:
                 live_ok, why = live_allowed(rows)
                 if live_ok:
