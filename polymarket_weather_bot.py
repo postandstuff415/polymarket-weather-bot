@@ -35,6 +35,8 @@ Needs POLYMARKET_KEY_ID and POLYMARKET_SECRET_KEY in a .env file next to this sc
     than LIVE_MAX_TRADES_PER_DAY new live trades per day
   * at most LIVE_MAX_PER_EVENT live trades per city/day, and at most one YES: brackets are
     exclusive, so two YES bets on one event can't both win (best edge is placed first)
+  * no YES long shots: nothing under LIVE_MIN_YES_PRICE, and YES under LIVE_YES_LONGSHOT_BELOW
+    needs extra edge (long-shot bias; see the settings)
   * kill switch: once settled live trades are down LIVE_KILL_LOSS, live stops for good
   * live test: after the first LIVE_TEST_TRADES live trades settle, if they didn't
     make money after fees, live stops for good
@@ -53,7 +55,7 @@ from decimal import Decimal, ROUND_HALF_EVEN
 import requests
 
 import weather_model as wm
-from weather_bot import build_model, now_utc  # also makes ¢ / °F printable on Windows
+from weather_bot import build_model, longshot_reason, now_utc  # also makes ¢ / °F printable on Windows
 
 # =============================================================================
 # SETTINGS
@@ -75,6 +77,12 @@ LIVE_MAX_OPEN_DOLLARS = 60.00    # most money ever tied up in unsettled live tra
 LIVE_MAX_TRADES_PER_DAY = 10     # new live trades per UTC day
 LIVE_MAX_PER_EVENT = 2           # live trades per city/day (one event); correlated bets
 LIVE_MAX_YES_PER_EVENT = 1       # only one bracket can win, so a second YES is a sure partial loss
+# Live YES long shots. Becker, "Microstructure of Wealth Transfer in Prediction Markets" (72M
+# Kalshi trades, 2021-2025): contracts under 20c win less often than their price implies, by far
+# the most for YES under 10c, and NO beats YES at most prices. Live only; paper still logs them.
+LIVE_MIN_YES_PRICE = 0.10        # no live YES bought below this
+LIVE_YES_LONGSHOT_BELOW = 0.20   # live YES below this price...
+LIVE_YES_LONGSHOT_EXTRA_EDGE = 0.03  # ...needs this much more than MIN_EDGE
 LIVE_KILL_LOSS = 40.00           # settled live trades down this much -> live stops for good
 LIVE_TEST_TRADES = 30            # once this many live trades settle, they must be net positive...
                                  # ...or live stops for good
@@ -373,6 +381,10 @@ def place_live(trade, rows, client, held):
     live = [r for r in rows if r.get("mode") == "live"]
     if trade["market"] in held:
         print(f"    [live] {trade['market']}: account already holds this market, skipped")
+        return None
+    why = longshot_reason(trade, MIN_EDGE, LIVE_MIN_YES_PRICE, LIVE_YES_LONGSHOT_BELOW, LIVE_YES_LONGSHOT_EXTRA_EDGE)
+    if why:
+        print(f"    [live] {trade['market']}: {why}; kept as paper")
         return None
     if len(live) >= LIVE_TEST_TRADES and any(r.get("status") != "settled" for r in live[:LIVE_TEST_TRADES]):
         return None
