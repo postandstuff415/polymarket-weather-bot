@@ -33,6 +33,8 @@ Needs POLYMARKET_KEY_ID and POLYMARKET_SECRET_KEY in a .env file next to this sc
   * LIVE_DOLLARS_PER_TRADE per order, whole contracts
   * never more than LIVE_MAX_OPEN_DOLLARS in unsettled live trades, and never more
     than LIVE_MAX_TRADES_PER_DAY new live trades per day
+  * at most LIVE_MAX_PER_EVENT live trades per city/day, and at most one YES: brackets are
+    exclusive, so two YES bets on one event can't both win (best edge is placed first)
   * kill switch: once settled live trades are down LIVE_KILL_LOSS, live stops for good
   * live test: after the first LIVE_TEST_TRADES live trades settle, if they didn't
     make money after fees, live stops for good
@@ -71,6 +73,8 @@ DEFAULT_FEE_RATE = 0.0695        # Polymarket US taker fee: rate x C x p x (1-p)
 LIVE_DOLLARS_PER_TRADE = 3.00    # spend about this much per trade (whole contracts, at least 1)
 LIVE_MAX_OPEN_DOLLARS = 60.00    # most money ever tied up in unsettled live trades
 LIVE_MAX_TRADES_PER_DAY = 10     # new live trades per UTC day
+LIVE_MAX_PER_EVENT = 2           # live trades per city/day (one event); correlated bets
+LIVE_MAX_YES_PER_EVENT = 1       # only one bracket can win, so a second YES is a sure partial loss
 LIVE_KILL_LOSS = 40.00           # settled live trades down this much -> live stops for good
 LIVE_TEST_TRADES = 30            # once this many live trades settle, they must be net positive...
                                  # ...or live stops for good
@@ -376,6 +380,13 @@ def place_live(trade, rows, client, held):
     if sum(1 for r in live if str(r.get("time_utc", ""))[:10] == today) >= LIVE_MAX_TRADES_PER_DAY:
         print(f"    [live] daily limit of {LIVE_MAX_TRADES_PER_DAY} live trades reached")
         return None
+    same_event = [r for r in live if r.get("event") == trade["event"]]
+    if len(same_event) >= LIVE_MAX_PER_EVENT:
+        print(f"    [live] {trade['market']}: already {len(same_event)} live trades on {trade['event']}, skipped")
+        return None
+    if trade["side"] == "YES" and sum(r.get("side") == "YES" for r in same_event) >= LIVE_MAX_YES_PER_EVENT:
+        print(f"    [live] {trade['market']}: already hold a YES on {trade['event']} (only one bracket can win), skipped")
+        return None
 
     cost = float(trade["price"])
     count = max(1, int(LIVE_DOLLARS_PER_TRADE // cost))
@@ -425,7 +436,7 @@ def go_live(signals, rows, client):
     except Exception as e:
         print(f"[!] Live paused this scan: couldn't read positions ({e})")
         return
-    for s in signals:
+    for s in sorted(signals, key=lambda s: -float(s["edge"])):  # best edge first when caps bind
         try:
             placed = place_live(s, rows, client, held)
         except Exception as e:
