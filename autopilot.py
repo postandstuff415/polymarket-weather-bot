@@ -42,7 +42,8 @@ START_BALANCE = 3877.00       # test baseline set Oct 8
 MAX_LOSS_DOLLARS = 387.70     # 10% of 3877
 
 # Only open positions priced between these (tails carry big settlement risk)
-MIN_ENTRY_PRICE = 0.15
+MIN_ENTRY_PRICE = 0.50   # favorites only: pnl_report.py showed 15-50c entries lost $73.68 (Oct 2-9);
+                         # the 72M-trade study: cheap YES is the overpaid side
 MAX_ENTRY_PRICE = 0.85
 # Don't open positions in markets that close within this many hours
 MIN_HOURS_TO_CLOSE = 6.0
@@ -101,6 +102,11 @@ TRADABLE_STATUSES = {"active", "open"}
 EXIT_TIME_BUDGET_SECONDS = 5.0     # exits never hold up quoting longer than this per cycle
 closed_tickers = set()             # markets seen closed; they never reopen, so skip forever
 last_exit_price = {}               # ticker -> price of our last exit ask (to avoid undercutting ourselves)
+# Positions whose best bid is at or below this are held to settlement instead of exited:
+# a 2c exit earns ~6c, but Kalshi reserves 98c per contract while it rests.
+PENNY_EXIT_MAX_BID = 0.02
+PENNY_RECHECK_SECONDS = 900        # re-check a penny position's price every 15 min, not every cycle
+penny_until = {}                   # ticker -> time before which it isn't re-checked
 
 if not os.path.exists(CSV_FILE):
     with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
@@ -273,7 +279,7 @@ def exit_price(m_data: dict):
 def run_inventory_exits(positions: dict, resting_orders: list):
     resting_tickers = {ro.get("ticker") for ro in resting_orders}
     deadline = time.monotonic() + EXIT_TIME_BUDGET_SECONDS
-    dust = closed = deferred = 0
+    dust = closed = deferred = penny = 0
 
     # Biggest positions first: the time budget used to be spent re-quoting 2¢ leftovers
     # while larger positions waited (often "9 deferred" every cycle).
@@ -294,6 +300,9 @@ def run_inventory_exits(positions: dict, resting_orders: list):
         if ticker in closed_tickers:
             closed += 1
             continue
+        if penny_until.get(ticker, 0) > time.time():
+            penny += 1
+            continue
         # Time budget: whatever is left gets handled next cycle.
         if time.monotonic() >= deadline:
             deferred += 1
@@ -310,6 +319,10 @@ def run_inventory_exits(positions: dict, resting_orders: list):
                 closed_tickers.add(ticker)
                 closed += 1
                 print(f"[-] {ticker} is {m_data.get('status', 'closed')}; holding to settlement, no exit order.")
+                continue
+            if _price(m_data, "yes_bid") <= PENNY_EXIT_MAX_BID:
+                penny_until[ticker] = time.time() + PENNY_RECHECK_SECONDS
+                penny += 1
                 continue
 
             print(f"\n[*] INVENTORY ACTION: Holding {count}x {ticker} (YES)")
@@ -343,8 +356,9 @@ def run_inventory_exits(positions: dict, resting_orders: list):
         except Exception as e:
             print(f"[!] Error managing exit on {ticker}: {e}")
 
-    if dust or closed or deferred:
+    if dust or closed or deferred or penny:
         print(f"[*] Exits skipped: {dust} dust (<1 contract) | {closed} closed/awaiting settlement | "
+              f"{penny} worth <={PENNY_EXIT_MAX_BID * 100:.0f}c (held to settlement) | "
               f"{deferred} deferred to next cycle ({EXIT_TIME_BUDGET_SECONDS:.0f}s budget)")
 
 
