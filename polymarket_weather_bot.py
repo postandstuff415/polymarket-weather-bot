@@ -33,10 +33,26 @@ Needs POLYMARKET_KEY_ID and POLYMARKET_SECRET_KEY in a .env file next to this sc
   * LIVE_DOLLARS_PER_TRADE per order, whole contracts
   * never more than LIVE_MAX_OPEN_DOLLARS in unsettled live trades, and never more
     than LIVE_MAX_TRADES_PER_DAY new live trades per day
+  * at most LIVE_MAX_PER_EVENT live trades per city/day, and at most one YES: brackets are
+    exclusive, so two YES bets on one event can't both win (best edge is placed first)
+  * no YES long shots: nothing under LIVE_MIN_YES_PRICE, and YES under LIVE_YES_LONGSHOT_BELOW
+    needs extra edge (long-shot bias; see the settings)
   * kill switch: once settled live trades are down LIVE_KILL_LOSS, live stops for good
   * live test: after the first LIVE_TEST_TRADES live trades settle, if they didn't
     make money after fees, live stops for good
 Signals that can't go live (caps, no fill, kill switch) are still logged as paper.
+
+Selling early (EXIT_MODE)
+-------------------------
+Every scan re-prices each open live bet. If selling at the current bid pays at least
+EXIT_MIN_EDGE per contract more (after the fee) than the bet is worth, it is sold with an
+immediate-or-cancel limit: that cuts bets the forecast turned against and banks winners the
+market overpays for. It never sells a bet worth more than the market pays. "Worth" is the
+model's probability, except on the settlement day, when the market prices live readings
+faster than the model can, so it is blended with the market mid (SAME_DAY_MODEL_WEIGHT).
+Never on bad data (model and market too far apart) or closed markets. Runs even while new
+live buys are paused, since selling only reduces risk. A sold market is never bought again.
+Every sale (or, in "monitor" mode, would-be sale) is logged to polymarket_exit_log.csv.
 """
 
 import argparse
@@ -46,7 +62,7 @@ import os
 import re
 import time
 from datetime import timedelta
-from decimal import Decimal, ROUND_HALF_EVEN
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN
 
 import requests
 
@@ -71,9 +87,22 @@ DEFAULT_FEE_RATE = 0.0695        # Polymarket US taker fee: rate x C x p x (1-p)
 LIVE_DOLLARS_PER_TRADE = 3.00    # spend about this much per trade (whole contracts, at least 1)
 LIVE_MAX_OPEN_DOLLARS = 60.00    # most money ever tied up in unsettled live trades
 LIVE_MAX_TRADES_PER_DAY = 10     # new live trades per UTC day
+LIVE_MAX_PER_EVENT = 2           # live trades per city/day (one event); correlated bets
+LIVE_MAX_YES_PER_EVENT = 1       # only one bracket can win, so a second YES is a sure partial loss
+# Live YES long shots. Becker, "Microstructure of Wealth Transfer in Prediction Markets" (72M
+# Kalshi trades, 2021-2025): contracts under 20c win less often than their price implies, by far
+# the most for YES under 10c, and NO beats YES at most prices. Live only; paper still logs them.
+LIVE_MIN_YES_PRICE = 0.10        # no live YES bought below this
+LIVE_YES_LONGSHOT_BELOW = 0.20   # live YES below this price...
+LIVE_YES_LONGSHOT_EXTRA_EDGE = 0.03  # ...needs this much more than MIN_EDGE
 LIVE_KILL_LOSS = 40.00           # settled live trades down this much -> live stops for good
 LIVE_TEST_TRADES = 30            # once this many live trades settle, they must be net positive...
                                  # ...or live stops for good
+
+# Selling early (only with --live). See "Selling early" above.
+EXIT_MODE = "live"               # "live" = really sell; "monitor" = only log what it would sell; "off"
+EXIT_MIN_EDGE = 0.03             # sell only when that beats holding by 3¢+ per contract after the fee
+SAME_DAY_MODEL_WEIGHT = 0.5      # settlement day: worth = 50% model + 50% market mid
 # =============================================================================
 
 GATEWAY = "https://gateway.polymarket.us/v1"   # public market data, no key needed
@@ -86,9 +115,13 @@ STATIONS = {st: (offset, name) for st, offset, name in wm.CITIES.values()}
 
 TRADES_CSV = "polymarket_paper_trades.csv"
 SNAPSHOT_CSV = "polymarket_model_log.csv"
+EXIT_LOG_CSV = "polymarket_exit_log.csv"
+EXIT_LOG_FIELDS = ["time_utc", "mode", "market", "side", "count", "entry_price", "sell_price", "sell_net",
+                   "fair_value", "edge", "pnl_if_sold", "filled", "order_id"]
 TRADE_FIELDS = ["time_utc", "mode", "market", "event", "city", "station", "bracket", "side", "price",
                 "fee", "count", "model_win_prob", "edge", "yes_bid", "yes_ask", "model_center_f",
-                "obs_max_f", "future_max_f", "status", "result", "pnl", "order_id", "fill_px_raw"]
+                "obs_max_f", "future_max_f", "status", "result", "pnl", "order_id", "fill_px_raw",
+                "exit_px", "exit_fee", "exit_time_utc", "exit_order_id"]
 SNAP_FIELDS = ["time_utc", "market", "bracket", "model_p_yes", "yes_bid", "yes_ask",
                "model_center_f", "obs_max_f", "future_max_f"]
 
@@ -364,17 +397,41 @@ def live_allowed(rows):
                   f"${open_cost:.2f} open of ${LIVE_MAX_OPEN_DOLLARS:.0f} cap")
 
 
+def longshot_reason(trade):
+    """Why a YES long shot shouldn't go live, or None."""
+    if trade["side"] != "YES":
+        return None
+    price, edge = float(trade["price"]), float(trade["edge"])
+    if price < LIVE_MIN_YES_PRICE:
+        return f"YES at {price * 100:.0f}¢ is under the {LIVE_MIN_YES_PRICE * 100:.0f}¢ live floor (long-shot bias)"
+    need = MIN_EDGE + LIVE_YES_LONGSHOT_EXTRA_EDGE
+    if price < LIVE_YES_LONGSHOT_BELOW and edge < need:
+        return f"YES at {price * 100:.0f}¢ needs {need * 100:.0f}¢ edge, has {edge * 100:.1f}¢ (long-shot bias)"
+    return None
+
+
 def place_live(trade, rows, client, held):
     """Send one real order for a signal. Returns (order_id, filled, count, raw_fill_px) or None."""
     live = [r for r in rows if r.get("mode") == "live"]
     if trade["market"] in held:
         print(f"    [live] {trade['market']}: account already holds this market, skipped")
         return None
+    why = longshot_reason(trade)
+    if why:
+        print(f"    [live] {trade['market']}: {why}; kept as paper")
+        return None
     if len(live) >= LIVE_TEST_TRADES and any(r.get("status") != "settled" for r in live[:LIVE_TEST_TRADES]):
         return None
     today = now_utc().date().isoformat()
     if sum(1 for r in live if str(r.get("time_utc", ""))[:10] == today) >= LIVE_MAX_TRADES_PER_DAY:
         print(f"    [live] daily limit of {LIVE_MAX_TRADES_PER_DAY} live trades reached")
+        return None
+    same_event = [r for r in live if r.get("event") == trade["event"]]
+    if len(same_event) >= LIVE_MAX_PER_EVENT:
+        print(f"    [live] {trade['market']}: already {len(same_event)} live trades on {trade['event']}, skipped")
+        return None
+    if trade["side"] == "YES" and sum(r.get("side") == "YES" for r in same_event) >= LIVE_MAX_YES_PER_EVENT:
+        print(f"    [live] {trade['market']}: already hold a YES on {trade['event']} (only one bracket can win), skipped")
         return None
 
     cost = float(trade["price"])
@@ -402,7 +459,15 @@ def place_live(trade, rows, client, held):
               "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
               "synchronousExecution": True,
               "maxBlockTime": "5"}
-    res = client.orders.create(params)
+    oid, filled, raw_px = order_fills(client, client.orders.create(params))
+    if filled <= 0:
+        print(f"    [live] {trade['market']}: not filled (price moved); kept as paper")
+        return None
+    return oid, filled, count, raw_px
+
+
+def order_fills(client, res):
+    """(order_id, contracts filled, raw fill prices) for an immediate-or-cancel order."""
     oid = res.get("id", "")
     fills = [e for e in res.get("executions") or []
              if e.get("type") in ("EXECUTION_TYPE_FILL", "EXECUTION_TYPE_PARTIAL_FILL")]
@@ -412,10 +477,7 @@ def place_live(trade, rows, client, held):
         o = (client.orders.retrieve(oid) or {}).get("order", {})
         filled = float(o.get("cumQuantity") or 0)
     raw_px = ";".join(str((e.get("lastPx") or {}).get("value", "")) for e in fills)
-    if filled <= 0:
-        print(f"    [live] {trade['market']}: not filled (price moved); kept as paper")
-        return None
-    return oid, filled, count, raw_px
+    return oid, filled, raw_px
 
 
 def go_live(signals, rows, client):
@@ -425,7 +487,7 @@ def go_live(signals, rows, client):
     except Exception as e:
         print(f"[!] Live paused this scan: couldn't read positions ({e})")
         return
-    for s in signals:
+    for s in sorted(signals, key=lambda s: -float(s["edge"])):  # best edge first when caps bind
         try:
             placed = place_live(s, rows, client, held)
         except Exception as e:
@@ -482,11 +544,142 @@ def check_live():
     print("No open temperature market with a two-sided book found to preview.")
 
 
+# ---- Selling early (--live only) -------------------------------------------------------
+def fair_value(side, mark):
+    """What the held side is worth now. On the settlement day the market prices live readings
+    faster than our model, so the model gets SAME_DAY_MODEL_WEIGHT and the market mid the rest."""
+    p_yes = mark["p_yes"]
+    if mark["same_day"] and 0 < mark["bid"] < mark["ask"] < 1:
+        mid = (mark["bid"] + mark["ask"]) / 2
+        p_yes = SAME_DAY_MODEL_WEIGHT * p_yes + (1 - SAME_DAY_MODEL_WEIGHT) * mid
+    return p_yes if side == "YES" else 1.0 - p_yes
+
+
+def exit_signal(side, mark):
+    """(sell_price, net_per_contract, fair_value) if selling beats holding by EXIT_MIN_EDGE, else None.
+    Prices are for the side held: a YES sells at the YES bid, a NO at 1 - YES ask."""
+    px = mark["bid"] if side == "YES" else round(1.0 - mark["ask"], 4)
+    if not 0.01 <= px <= 0.99:
+        return None   # no buyer at a real price
+    value = fair_value(side, mark)
+    net = px - taker_fee(px, mark["rate"])
+    if net - value < EXIT_MIN_EDGE:
+        return None
+    return px, net, value
+
+
+def cents(value, up):
+    """Limit price to the cent, rounded so an immediate-or-cancel order can still fill."""
+    return str(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_CEILING if up else ROUND_FLOOR))
+
+
+def sell_live(client, row, mark, qty):
+    """Sell `qty` contracts of a live bet at the current bid. Returns (order_id, filled)."""
+    # Prices are in YES terms: a YES sells at the YES bid; a NO is closed by buying YES at the ask.
+    is_yes = row["side"] == "YES"
+    params = {"marketSlug": row["market"],
+              "intent": "ORDER_INTENT_SELL_LONG" if is_yes else "ORDER_INTENT_SELL_SHORT",
+              "type": "ORDER_TYPE_LIMIT",
+              "price": {"value": cents(mark["bid"] if is_yes else mark["ask"], up=not is_yes), "currency": "USD"},
+              "quantity": qty,
+              "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+              "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+              "synchronousExecution": True,
+              "maxBlockTime": "5"}
+    oid, filled, _ = order_fills(client, client.orders.create(params))
+    return oid, filled
+
+
+def record_exit(rows, row, filled, px, rate, oid):
+    """Book a sale: the sold contracts become a settled row (result 'sold'); any rest stays open."""
+    count, entry_fee = float(row["count"]), float(row.get("fee") or 0)
+    share = min(filled / count, 1.0)
+    sell_fee = taker_fee(px, rate, filled, rounded=True)
+    sold = dict(row)
+    sold.update(count=f"{filled:g}", fee=f"{entry_fee * share:.4f}", status="settled", result="sold",
+                pnl=f"{(px - float(row['price'])) * filled - entry_fee * share - sell_fee:.4f}",
+                exit_px=f"{px:.4f}", exit_fee=f"{sell_fee:.4f}", exit_time_utc=now_utc().isoformat(),
+                exit_order_id=oid)
+    if share >= 1.0:
+        row.update(sold)
+    else:
+        row.update(count=f"{count - filled:g}", fee=f"{entry_fee * (1 - share):.4f}")
+        rows.append(sold)
+
+
+def pnl_if_sold(row, qty, net):
+    """Estimated P&L of selling qty contracts at `net` per contract, including their share of the entry fee."""
+    count = float(row.get("count") or qty)
+    return (net - float(row["price"])) * qty - float(row.get("fee") or 0) * qty / count
+
+
+def log_exit(row, qty, px, net, value, filled="", oid=""):
+    new = not os.path.exists(EXIT_LOG_CSV)
+    with open(EXIT_LOG_CSV, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=EXIT_LOG_FIELDS)
+        if new:
+            w.writeheader()
+        w.writerow({"time_utc": now_utc().isoformat(), "mode": EXIT_MODE, "market": row["market"],
+                    "side": row["side"], "count": qty, "entry_price": row["price"], "sell_price": f"{px:.4f}",
+                    "sell_net": f"{net:.4f}", "fair_value": f"{value:.4f}", "edge": f"{net - value:.4f}",
+                    "pnl_if_sold": f"{pnl_if_sold(row, qty, net):.4f}", "filled": filled, "order_id": oid})
+
+
+def manage_exits(rows, marks, client):
+    """Sell open live bets the market now pays more for than they're worth. Returns rows changed."""
+    if EXIT_MODE not in ("monitor", "live"):
+        return 0
+    try:
+        positions = client.portfolio.positions().get("positions") or {}
+    except Exception as e:
+        print(f"[!] Selling early skipped this scan: couldn't read positions ({e})")
+        return 0
+    changed = 0
+    for row in [r for r in rows if r.get("mode") == "live" and r.get("status") == "open"]:
+        mark = marks.get(row["market"])
+        if not mark or not mark["open"] or not mark["gap_ok"]:
+            continue   # closed market or untrustworthy model: hold
+        held = abs(float((positions.get(row["market"]) or {}).get("qtyAvailable") or 0))
+        qty = int(min(float(row.get("count") or 0), held))
+        sig = exit_signal(row["side"], mark)
+        if qty < 1 or not sig:
+            continue
+        px, net, value = sig
+        desc = (f"{row['side']} {qty}x {row['market']} @ ${px:.2f} (worth ${value:.2f}, "
+                f"bought ${float(row['price']):.2f}, P&L about ${pnl_if_sold(row, qty, net):+.2f})")
+        if EXIT_MODE == "monitor":
+            log_exit(row, qty, px, net, value)
+            print(f"    [exit monitor] would sell {desc}")
+            continue
+        try:
+            oid, filled = sell_live(client, row, mark, qty)
+        except Exception as e:
+            # Like buys: if it reached the exchange, next scan's positions check sees the smaller size.
+            print(f"[!] SELL ORDER ERROR on {row['market']}: {e}. Stopping sells this scan.")
+            break
+        log_exit(row, qty, px, net, value, f"{filled:g}", oid)
+        if filled <= 0:
+            print(f"    [sell] {row['market']}: not filled (price moved); holding")
+            continue
+        sold_pnl = pnl_if_sold(row, filled, net)
+        record_exit(rows, row, filled, px, mark["rate"], oid)
+        changed += 1
+        print(f"    [SOLD] {row['side']} {filled:g} of {qty} x {row['market']} @ ${px:.2f} "
+              f"(worth ${value:.2f}), P&L about ${sold_pnl:+.2f} (order {oid})")
+        try:
+            save_trades(rows)
+        except Exception as e:
+            print(f"[!!] SALE {oid} could not be saved to {TRADES_CSV} ({e}). "
+                  f"Sells paused this scan. Close the file if it is open in Excel.")
+            break
+    return changed
+
+
 # ---- One scan -------------------------------------------------------------------------
 def scan(rows, take_snapshot, verbose=False):
     traded = {r["market"] for r in rows}
     signals, snapshots, problems = [], [], []
-    events = {}
+    events, marks = {}, {}   # marks: market -> latest model price and quotes, for selling early
     now = now_utc()
     today = now.date()
     days = [today + timedelta(days=d) for d in range(-1, DAYS_AHEAD + 1)]
@@ -550,6 +743,9 @@ def scan(rows, take_snapshot, verbose=False):
             for b, p in zip(brackets, probs):
                 m, bid, ask = b["m"], b["bid"], b["ask"]
                 label = bracket_label(b["lo"], b["hi"])
+                rate = float(m.get("feeCoefficient") or DEFAULT_FEE_RATE)
+                marks[m["slug"]] = {"p_yes": p, "bid": bid, "ask": ask, "rate": rate,
+                                    "open": b["open"], "gap_ok": gap_ok, "same_day": not now < day_start}
                 if take_snapshot:
                     snapshots.append({"time_utc": now.isoformat(), "market": m["slug"], "bracket": label,
                                       "model_p_yes": f"{p:.4f}", "yes_bid": bid, "yes_ask": ask,
@@ -558,7 +754,6 @@ def scan(rows, take_snapshot, verbose=False):
                                       "future_max_f": "" if fut is None else f"{fut:.1f}"})
                 if m["slug"] in traded or not b["open"] or not gap_ok or not tradable_day:
                     continue
-                rate = float(m.get("feeCoefficient") or DEFAULT_FEE_RATE)
                 best = best_trade(p, bid, ask, rate)
                 if not best:
                     continue
@@ -578,7 +773,7 @@ def scan(rows, take_snapshot, verbose=False):
             print(f"  [{i:>2}/{len(codes)}] {code:<5} {found} open event(s)", flush=True)
 
     rows.extend(signals)
-    return signals, snapshots, problems, events
+    return signals, snapshots, problems, events, marks
 
 
 def print_cycle(signals, problems, rows):
@@ -622,6 +817,7 @@ def main():
         print(f"  ${LIVE_DOLLARS_PER_TRADE:.2f}/trade, max ${LIVE_MAX_OPEN_DOLLARS:.0f} open, "
               f"max {LIVE_MAX_TRADES_PER_DAY} trades/day, stops at -${LIVE_KILL_LOSS:.0f}")
         print(f"  Buying power: ${buying_power(client):.2f}")
+        print(f"  Selling early: {EXIT_MODE} (when the market pays {EXIT_MIN_EDGE * 100:.0f}¢+ more than a bet is worth)")
     else:
         print("  POLYMARKET US WEATHER BOT  -  PAPER MODE: no orders are placed")
     print("=" * 66)
@@ -633,10 +829,12 @@ def main():
             rows = load_trades()
             take_snap = time.time() - last_snapshot >= SNAPSHOT_EVERY_SECONDS
             print("[*] Scanning Polymarket US temperature markets...", flush=True)
-            signals, snaps, problems, events = scan(rows, take_snap, verbose=first_scan)
+            signals, snaps, problems, events, marks = scan(rows, take_snap, verbose=first_scan)
             first_scan = False
             settled_now = settle_trades(rows, events)
             if client is not None:
+                # Selling early runs even when new buys are paused: it only reduces risk.
+                settled_now += manage_exits(rows, marks, client)
                 live_ok, why = live_allowed(rows)
                 if live_ok:
                     # Never place real orders unless the trade record can be written.
