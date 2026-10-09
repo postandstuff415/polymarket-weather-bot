@@ -46,6 +46,11 @@ MIN_ENTRY_PRICE = 0.15
 MAX_ENTRY_PRICE = 0.85
 # Don't open positions in markets that close within this many hours
 MIN_HOURS_TO_CLOSE = 6.0
+# ...and stop opening positions this many hours BEFORE the event itself starts.
+# Sports markets "close" ~2 days after the game, so the close-time check above never
+# caught in-play games, where prices jump on every play and our bids get picked off.
+# Uses Kalshi's occurrence_datetime (game start); markets without one are unaffected.
+MIN_HOURS_BEFORE_EVENT = 1.0
 # ...and never in markets that close more than 7 days out (no long bets)
 MAX_HOURS_TO_CLOSE = 168.0
 # Spread risk across at most this many markets at once (positions + open orders)
@@ -135,6 +140,17 @@ def fetch_cash_balance():
         return None
 
 
+def hours_until(raw):
+    """Hours from now until an ISO timestamp (negative if past), or None."""
+    if not raw:
+        return None
+    try:
+        t = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        return (t - datetime.now(timezone.utc)).total_seconds() / 3600.0
+    except Exception:
+        return None
+
+
 def hours_to_close(market: dict):
     raw = market.get("close_time") or market.get("expected_expiration_time")
     if not raw:
@@ -181,6 +197,7 @@ def fetch_open_liquid_markets():
                     "yes_ask": ask_val,
                     "spread_cents": int(round((ask_val - bid_val) * 100)),
                     "hours_to_close": hours_to_close(m),
+                    "hours_to_event": hours_until(m.get("occurrence_datetime")),
                 })
         return valid
     except Exception as e:
@@ -230,7 +247,9 @@ def run_inventory_exits(positions: dict, resting_orders: list):
     deadline = time.monotonic() + EXIT_TIME_BUDGET_SECONDS
     dust = closed = deferred = 0
 
-    for ticker, p in positions.items():
+    # Biggest positions first: the time budget used to be spent re-quoting 2¢ leftovers
+    # while larger positions waited (often "9 deferred" every cycle).
+    for ticker, p in sorted(positions.items(), key=lambda kv: kv[1].get("market_exposure", 0.0), reverse=True):
         qty = p.get("position", 0.0)
         # Only YES inventory (qty > 0) is exited: the bot only buys YES, and an
         # "ask" on a NO holding would open a new position instead of closing one.
@@ -379,7 +398,7 @@ try:
             active_tickers = {ro.get("ticker") for ro in resting_orders}.union(positions.keys())
             print(f"[*] Active markets: {len(active_tickers)} / {MAX_ACTIVE_MARKETS}")
             placed_this_cycle = 0
-            skipped_price = skipped_time = 0
+            skipped_price = skipped_time = skipped_live = 0
 
             for m in spread_candidates:
                 if placed_this_cycle >= MAX_MARKETS_PER_PASS or len(active_tickers) >= MAX_ACTIVE_MARKETS:
@@ -397,6 +416,10 @@ try:
                 htc = m["hours_to_close"]
                 if htc is None or htc < MIN_HOURS_TO_CLOSE or htc > MAX_HOURS_TO_CLOSE:
                     skipped_time += 1
+                    continue
+                hte = m["hours_to_event"]
+                if hte is not None and hte < MIN_HOURS_BEFORE_EVENT:
+                    skipped_live += 1
                     continue
 
                 approved, reason = risk.evaluate_order(
@@ -420,9 +443,10 @@ try:
                         active_tickers.add(ticker)
                         placed_this_cycle += 1
 
-            if skipped_price or skipped_time:
+            if skipped_price or skipped_time or skipped_live:
                 print(f"[*] Skipped: {skipped_price} outside {int(MIN_ENTRY_PRICE*100)}-{int(MAX_ENTRY_PRICE*100)}¢ | "
-                      f"{skipped_time} closing within {MIN_HOURS_TO_CLOSE:.0f}h, beyond 7 days, or no close time")
+                      f"{skipped_time} closing within {MIN_HOURS_TO_CLOSE:.0f}h, beyond 7 days, or no close time | "
+                      f"{skipped_live} event starting within {MIN_HOURS_BEFORE_EVENT:g}h or in play")
 
             print(f"\n[✓] Cycle {cycle:04d} complete. Resting {CYCLE_INTERVAL_SECONDS}s before next heartbeat...")
             consecutive_errors = 0
