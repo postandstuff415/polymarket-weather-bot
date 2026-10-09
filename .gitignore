@@ -23,3 +23,7 @@ patched_oct8/
 # Scaler state and account equity history (personal)
 mm_scaler_state.json
 equity_log.csv
+
+# Research downloads (weather_research.py cache)
+research_data/
+research_run.log
