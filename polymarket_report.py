@@ -22,13 +22,30 @@ def main():
         return
     with open(TRADES_CSV, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
-    settled = [r for r in rows if r.get("status") == "settled"]
-    open_rows = [r for r in rows if r.get("status") == "open"]
+    live = [r for r in rows if r.get("mode") == "live"]
+    if live:
+        done = [r for r in live if r.get("status") == "settled"]
+        lp = sum(float(r["pnl"]) for r in done)
+        at_risk = sum(float(r["price"]) * float(r.get("count") or 1) + float(r.get("fee") or 0)
+                      for r in live if r.get("status") == "open")
+        print("=" * 60)
+        print("  LIVE TRADES (real money)")
+        print("=" * 60)
+        print(f"  Placed: {len(live)}  |  settled: {len(done)}  |  net after fees: ${lp:+.2f}"
+              f"  |  open: ${at_risk:.2f} at risk")
+        if done:
+            wins = sum(1 for r in done if float(r["pnl"]) > 0)
+            print(f"  Win rate: {wins}/{len(done)} = {wins/len(done):.0%}")
+        print()
+
+    # Paper only below: live trades have different sizes and are reported above
+    settled = [r for r in rows if r.get("status") == "settled" and r.get("mode", "paper") == "paper"]
+    open_rows = [r for r in rows if r.get("status") == "open" and r.get("mode", "paper") == "paper"]
 
     print("=" * 60)
     print("  POLYMARKET WEATHER BOT - PAPER RESULTS")
     print("=" * 60)
-    print(f"  Trades recorded: {len(rows)}  |  settled: {len(settled)}  |  waiting: {len(open_rows)}")
+    print(f"  Paper trades: {len(settled) + len(open_rows)}  |  settled: {len(settled)}  |  waiting: {len(open_rows)}")
     if not settled:
         print("  No paper trades have settled yet. Daily markets settle the morning after.")
         return

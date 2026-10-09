@@ -1,10 +1,12 @@
 """
-polymarket_weather_bot.py - Polymarket US daily-high temperature bot. PAPER ONLY:
-it places no orders and needs no API keys (market data is public).
+polymarket_weather_bot.py - Polymarket US daily-high temperature bot.
+Paper by default: places no orders and needs no API keys (market data is public).
 
-    python polymarket_weather_bot.py            scan every 5 minutes, record paper trades
-    python polymarket_weather_bot.py --once     one scan, print the table, exit
-    python polymarket_report.py                 how the paper trades are doing
+    python polymarket_weather_bot.py               scan every 5 minutes, record paper trades
+    python polymarket_weather_bot.py --once        one scan, print the table, exit
+    python polymarket_weather_bot.py --check-live  test the API keys; previews orders, places none
+    python polymarket_weather_bot.py --live        REAL MONEY, within the LIVE_ limits below
+    python polymarket_report.py                    how the trades are doing
 
 Same idea as weather_bot.py (Kalshi), pointed at Polymarket US
 ----------------------------------------------------------------
@@ -22,8 +24,19 @@ Every scan:
    US's taker fee, records a PAPER trade in polymarket_paper_trades.csv. One per market.
 4. Fills in each paper trade's result and profit once its market resolves.
 
-Live trading is not built yet. It needs a verified Polymarket US account and API
-keys (polymarket.us/developer), and should wait until the paper record shows an edge.
+Live mode (--live)
+-----------------
+Needs POLYMARKET_KEY_ID and POLYMARKET_SECRET_KEY in a .env file next to this script
+(never commit it; .gitignore blocks it). Signals become real orders, one per market:
+  * limit order at the current best price, immediate-or-cancel, so it never rests on
+    the book and never fills worse than the price the edge was computed at
+  * LIVE_DOLLARS_PER_TRADE per order, whole contracts
+  * never more than LIVE_MAX_OPEN_DOLLARS in unsettled live trades, and never more
+    than LIVE_MAX_TRADES_PER_DAY new live trades per day
+  * kill switch: once settled live trades are down LIVE_KILL_LOSS, live stops for good
+  * live test: after the first LIVE_TEST_TRADES live trades settle, if they didn't
+    make money after fees, live stops for good
+Signals that can't go live (caps, no fill, kill switch) are still logged as paper.
 """
 
 import argparse
@@ -53,6 +66,14 @@ TRADE_SAME_DAY = False           # same-day markets are priced off live readings
 DAYS_AHEAD = 2                   # look for events up to this many days past today
 SNAPSHOT_EVERY_SECONDS = 3600    # log every bracket's model vs market once an hour
 DEFAULT_FEE_RATE = 0.0695        # Polymarket US taker fee: rate x C x p x (1-p); per-market feeCoefficient wins
+
+# Live limits (only used with --live). Sized for a ~$130 account.
+LIVE_DOLLARS_PER_TRADE = 3.00    # spend about this much per trade (whole contracts, at least 1)
+LIVE_MAX_OPEN_DOLLARS = 60.00    # most money ever tied up in unsettled live trades
+LIVE_MAX_TRADES_PER_DAY = 10     # new live trades per UTC day
+LIVE_KILL_LOSS = 40.00           # settled live trades down this much -> live stops for good
+LIVE_TEST_TRADES = 30            # once this many live trades settle, they must be net positive...
+                                 # ...or live stops for good
 # =============================================================================
 
 GATEWAY = "https://gateway.polymarket.us/v1"   # public market data, no key needed
@@ -67,7 +88,7 @@ TRADES_CSV = "polymarket_paper_trades.csv"
 SNAPSHOT_CSV = "polymarket_model_log.csv"
 TRADE_FIELDS = ["time_utc", "mode", "market", "event", "city", "station", "bracket", "side", "price",
                 "fee", "count", "model_win_prob", "edge", "yes_bid", "yes_ask", "model_center_f",
-                "obs_max_f", "future_max_f", "status", "result", "pnl"]
+                "obs_max_f", "future_max_f", "status", "result", "pnl", "order_id", "fill_px_raw"]
 SNAP_FIELDS = ["time_utc", "market", "bracket", "model_p_yes", "yes_bid", "yes_ask",
                "model_center_f", "obs_max_f", "future_max_f"]
 
@@ -201,11 +222,18 @@ def best_trade(p_yes, yes_bid, yes_ask, rate):
 
 
 # ---- Trade log ----------------------------------------------------------------------
+_unsaved_live = {}   # market -> live trade row placed but not yet written to TRADES_CSV
+
+
 def load_trades():
-    if not os.path.exists(TRADES_CSV):
-        return []
-    with open(TRADES_CSV, newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
+    rows = []
+    if os.path.exists(TRADES_CSV):
+        with open(TRADES_CSV, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    # Real orders whose save failed are kept in memory so they're never placed twice
+    on_file = {r.get("market") for r in rows}
+    rows.extend(r for m, r in _unsaved_live.items() if m not in on_file)
+    return rows
 
 
 def save_trades(rows):
@@ -216,6 +244,9 @@ def save_trades(rows):
         for r in rows:
             w.writerow({k: r.get(k, "") for k in TRADE_FIELDS})
     os.replace(tmp, TRADES_CSV)
+    saved = {r.get("market") for r in rows}
+    for m in [m for m in _unsaved_live if m in saved]:
+        del _unsaved_live[m]
 
 
 def append_snapshots(rows):
@@ -266,6 +297,182 @@ def settle_trades(rows, events):
         r["status"] = "settled"
         changed += 1
     return changed
+
+
+# ---- Live (--live only) ---------------------------------------------------------------
+_client = None
+
+
+def live_client():
+    """Authenticated Polymarket US client, keys from .env next to this script."""
+    global _client
+    if _client is None:
+        from dotenv import load_dotenv
+        from polymarket_us import PolymarketUS
+        load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), override=True)
+        key_id = os.getenv("POLYMARKET_KEY_ID", "").strip()
+        secret = os.getenv("POLYMARKET_SECRET_KEY", "").strip()
+        if not key_id or not secret:
+            raise RuntimeError("POLYMARKET_KEY_ID / POLYMARKET_SECRET_KEY missing from .env")
+        _client = PolymarketUS(key_id=key_id, secret_key=secret)
+    return _client
+
+
+def buying_power(client):
+    return float(client.account.balances().get("buyingPower") or 0.0)
+
+
+def held_markets(client):
+    """Markets the account already has a position in (never add to them)."""
+    pos = client.portfolio.positions().get("positions") or {}
+    if isinstance(pos, dict):
+        return set(pos)
+    return {p.get("marketSlug") for p in pos if isinstance(p, dict)}
+
+
+def live_cost(r):
+    return float(r["price"]) * float(r.get("count") or 1) + float(r.get("fee") or 0)
+
+
+def live_allowed(rows):
+    """Returns (allowed, reason). Checked once per scan; place_live re-checks per order."""
+    live = [r for r in rows if r.get("mode") == "live"]
+    settled = [r for r in live if r.get("status") == "settled"]
+    net = sum(float(r["pnl"]) for r in settled)
+    if net <= -LIVE_KILL_LOSS:
+        return False, f"KILL SWITCH: live trades lost ${-net:.2f} (limit ${LIVE_KILL_LOSS:.2f}); paper only"
+    # Live test: the first LIVE_TEST_TRADES live trades placed decide it. No live trade
+    # beyond them until all have settled; then they must be net positive after fees.
+    test = live[:LIVE_TEST_TRADES]
+    test_net = sum(float(r["pnl"]) for r in test if r.get("status") == "settled")
+    if len(test) >= LIVE_TEST_TRADES:
+        if any(r.get("status") != "settled" for r in test):
+            return False, (f"live test: all {LIVE_TEST_TRADES} trades placed, waiting for them to settle "
+                           f"(net ${test_net:+.2f} so far)")
+        if test_net <= 0:
+            return False, f"LIVE TEST FAILED: first {LIVE_TEST_TRADES} live trades net ${test_net:+.2f}; paper only"
+    open_cost = sum(live_cost(r) for r in live if r.get("status") == "open")
+    phase = "test passed" if len(test) >= LIVE_TEST_TRADES else f"test {len(test)}/{LIVE_TEST_TRADES}"
+    return True, (f"LIVE ({phase}): {len(settled)} settled, net ${net:+.2f} | "
+                  f"${open_cost:.2f} open of ${LIVE_MAX_OPEN_DOLLARS:.0f} cap")
+
+
+def place_live(trade, rows, client, held):
+    """Send one real order for a signal. Returns (order_id, filled, count, raw_fill_px) or None."""
+    live = [r for r in rows if r.get("mode") == "live"]
+    if trade["market"] in held:
+        print(f"    [live] {trade['market']}: account already holds this market, skipped")
+        return None
+    if len(live) >= LIVE_TEST_TRADES and any(r.get("status") != "settled" for r in live[:LIVE_TEST_TRADES]):
+        return None
+    today = now_utc().date().isoformat()
+    if sum(1 for r in live if str(r.get("time_utc", ""))[:10] == today) >= LIVE_MAX_TRADES_PER_DAY:
+        print(f"    [live] daily limit of {LIVE_MAX_TRADES_PER_DAY} live trades reached")
+        return None
+
+    cost = float(trade["price"])
+    count = max(1, int(LIVE_DOLLARS_PER_TRADE // cost))
+    fee = taker_fee(cost, trade["_rate"], count, rounded=True)
+    need = cost * count + fee
+    open_cost = sum(live_cost(r) for r in live if r.get("status") == "open")
+    if open_cost + need > LIVE_MAX_OPEN_DOLLARS:
+        print(f"    [live] skipped: ${open_cost:.2f} already open (cap ${LIVE_MAX_OPEN_DOLLARS:.2f})")
+        return None
+    bp = buying_power(client)
+    if bp < need:
+        print(f"    [live] skipped: buying power ${bp:.2f} < ${need:.2f} needed")
+        return None
+
+    # Polymarket US prices every order in YES terms. Buying NO = BUY_SHORT at the YES bid
+    # (NO cost = 1 - bid). IOC limit: fills at this price or better, or not at all.
+    yes_px = float(trade["yes_ask"]) if trade["side"] == "YES" else float(trade["yes_bid"])
+    params = {"marketSlug": trade["market"],
+              "intent": "ORDER_INTENT_BUY_LONG" if trade["side"] == "YES" else "ORDER_INTENT_BUY_SHORT",
+              "type": "ORDER_TYPE_LIMIT",
+              "price": {"value": f"{yes_px:.2f}", "currency": "USD"},
+              "quantity": count,
+              "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+              "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+              "synchronousExecution": True,
+              "maxBlockTime": "5"}
+    res = client.orders.create(params)
+    oid = res.get("id", "")
+    fills = [e for e in res.get("executions") or []
+             if e.get("type") in ("EXECUTION_TYPE_FILL", "EXECUTION_TYPE_PARTIAL_FILL")]
+    filled = sum(float(e.get("lastShares") or 0) for e in fills)
+    if not res.get("executions") and oid:
+        time.sleep(1.0)   # no synchronous result: ask for the order's final state
+        o = (client.orders.retrieve(oid) or {}).get("order", {})
+        filled = float(o.get("cumQuantity") or 0)
+    raw_px = ";".join(str((e.get("lastPx") or {}).get("value", "")) for e in fills)
+    if filled <= 0:
+        print(f"    [live] {trade['market']}: not filled (price moved); kept as paper")
+        return None
+    return oid, filled, count, raw_px
+
+
+def go_live(signals, rows, client):
+    """Turn this scan's signals into real orders, within the limits. Unplaced ones stay paper."""
+    try:
+        held = held_markets(client)
+    except Exception as e:
+        print(f"[!] Live paused this scan: couldn't read positions ({e})")
+        return
+    for s in signals:
+        try:
+            placed = place_live(s, rows, client, held)
+        except Exception as e:
+            # The order may or may not have reached the exchange. The positions check
+            # next scan stops it being placed twice if it did.
+            print(f"[!] LIVE ORDER ERROR on {s['market']}: {e}. Stopping live orders this scan.")
+            return
+        if not placed:
+            continue
+        oid, filled, count, raw_px = placed
+        s["mode"], s["count"], s["order_id"], s["fill_px_raw"] = "live", f"{filled:g}", oid, raw_px
+        s["fee"] = f"{taker_fee(float(s['price']), s['_rate'], filled, rounded=True):.2f}"
+        held.add(s["market"])
+        _unsaved_live[s["market"]] = s
+        print(f"    [LIVE] {s['side']} {filled:g} x {s['market']} @ ${float(s['price']):.2f} (order {oid})")
+        # Record every real order the moment it fills; if the file can't be written
+        # (e.g. open in Excel), stop placing orders until it can.
+        try:
+            save_trades(rows)
+        except Exception as e:
+            print(f"[!!] LIVE ORDER {oid} could not be saved to {TRADES_CSV} ({e}). "
+                  f"Live paused this scan. Close the file if it is open in Excel.")
+            return
+
+
+def check_live():
+    """Prove the keys work and show how the exchange reads our orders. Places nothing."""
+    client = live_client()
+    bal = client.account.balances()
+    print(f"[ok] Keys work. Balance ${float(bal.get('currentBalance') or 0):.2f}, "
+          f"buying power ${float(bal.get('buyingPower') or 0):.2f}")
+    print(f"[ok] Markets with a position: {len(held_markets(client))}")
+    tomorrow = now_utc().date() + timedelta(days=1)
+    for code in KNOWN_CITY_CODES:
+        ev = get_event(f"temp-{code}high-{tomorrow:%Y-%m-%d}")
+        for m in (ev or {}).get("markets", []):
+            bid, ask = quote(m, "bestBidQuote"), quote(m, "bestAskQuote")
+            if 0.05 <= bid < ask <= 0.95:
+                print(f"\nPreviewing orders on {m['slug']} (YES bid {bid:.2f} / ask {ask:.2f}). NOT placed:")
+                for intent, px, meaning in (("ORDER_INTENT_BUY_LONG", ask, f"buy YES at ${ask:.2f}"),
+                                            ("ORDER_INTENT_BUY_SHORT", bid, f"buy NO at ${1 - bid:.2f}")):
+                    req = {"marketSlug": m["slug"], "intent": intent, "type": "ORDER_TYPE_LIMIT",
+                           "price": {"value": f"{px:.2f}", "currency": "USD"}, "quantity": 1,
+                           "tif": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL"}
+                    try:
+                        o = client.orders.preview({"request": req}).get("order", {})
+                        print(f"  want {meaning:<18} -> exchange reads: side={o.get('side')} "
+                              f"price={(o.get('price') or {}).get('value')} intent={o.get('intent')}")
+                    except Exception as e:
+                        print(f"  want {meaning:<18} -> preview failed: {e}")
+                print("\nExpected: buy YES -> ORDER_SIDE_BUY at the ask; buy NO -> ORDER_SIDE_SELL at the YES bid.")
+                print("No orders were placed.")
+                return
+    print("No open temperature market with a two-sided book found to preview.")
 
 
 # ---- One scan -------------------------------------------------------------------------
@@ -344,7 +551,8 @@ def scan(rows, take_snapshot, verbose=False):
                                       "future_max_f": "" if fut is None else f"{fut:.1f}"})
                 if m["slug"] in traded or not b["open"] or not gap_ok or not tradable_day:
                     continue
-                best = best_trade(p, bid, ask, float(m.get("feeCoefficient") or DEFAULT_FEE_RATE))
+                rate = float(m.get("feeCoefficient") or DEFAULT_FEE_RATE)
+                best = best_trade(p, bid, ask, rate)
                 if not best:
                     continue
                 side, cost, fee, win_p, edge = best
@@ -358,7 +566,7 @@ def scan(rows, take_snapshot, verbose=False):
                     "model_center_f": f"{model.center():.1f}",
                     "obs_max_f": "" if obs is None else f"{obs:.1f}",
                     "future_max_f": "" if fut is None else f"{fut:.1f}",
-                    "status": "open", "result": "", "pnl": ""})
+                    "status": "open", "result": "", "pnl": "", "_rate": rate})
         if verbose:
             print(f"  [{i:>2}/{len(codes)}] {code:<5} {found} open event(s)", flush=True)
 
@@ -370,26 +578,45 @@ def print_cycle(signals, problems, rows):
     stamp = now_utc().astimezone().strftime("%H:%M:%S")
     print(f"\n================ POLYMARKET WEATHER SCAN {stamp} ================")
     for s in signals:
-        print(f"  [PAPER] {s['side']:<3} {s['city'][:22]:<22} {s['event'][-10:]} {s['bracket']:<12}"
+        size = f"{s['count']}x " if s["mode"] == "live" else ""
+        print(f"  [{s['mode'].upper()}] {s['side']:<3} {size}{s['city'][:22]:<22} {s['event'][-10:]} {s['bracket']:<12}"
               f" @ ${float(s['price']):.2f}  model {float(s['model_win_prob']):.0%}"
               f"  edge {float(s['edge'])*100:+.1f}¢  (model high {s['model_center_f']}°F)")
     if not signals:
         print("  No new trades this scan (nothing beat the edge threshold).")
     for p in problems[:15]:
         print(f"  [!] {p}")
-    settled = [r for r in rows if r.get("status") == "settled"]
-    net = sum(float(r["pnl"]) for r in settled)
-    open_n = sum(1 for r in rows if r.get("status") == "open")
-    print(f"  Paper record: {len(settled)} settled, net ${net:+.2f} | {open_n} open")
+    for mode in ("paper", "live"):
+        mine = [r for r in rows if r.get("mode", "paper") == mode]
+        if mode == "live" and not mine:
+            continue
+        settled = [r for r in mine if r.get("status") == "settled"]
+        net = sum(float(r["pnl"]) for r in settled)
+        open_n = sum(1 for r in mine if r.get("status") == "open")
+        print(f"  {mode.capitalize()} record: {len(settled)} settled, net ${net:+.2f} | {open_n} open")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true", help="run one scan and exit")
+    ap.add_argument("--live", action="store_true", help="REAL MONEY: place orders within the LIVE_ limits")
+    ap.add_argument("--check-live", action="store_true", help="test API keys and preview orders; places none")
     args = ap.parse_args()
 
+    if args.check_live:
+        check_live()
+        return
+
+    client = None
     print("=" * 66)
-    print("  POLYMARKET US WEATHER BOT  -  PAPER MODE: no orders are placed")
+    if args.live:
+        client = live_client()
+        print("  POLYMARKET US WEATHER BOT  -  LIVE: REAL MONEY")
+        print(f"  ${LIVE_DOLLARS_PER_TRADE:.2f}/trade, max ${LIVE_MAX_OPEN_DOLLARS:.0f} open, "
+              f"max {LIVE_MAX_TRADES_PER_DAY} trades/day, stops at -${LIVE_KILL_LOSS:.0f}")
+        print(f"  Buying power: ${buying_power(client):.2f}")
+    else:
+        print("  POLYMARKET US WEATHER BOT  -  PAPER MODE: no orders are placed")
     print("=" * 66)
 
     last_snapshot = 0.0
@@ -402,6 +629,17 @@ def main():
             signals, snaps, problems, events = scan(rows, take_snap, verbose=first_scan)
             first_scan = False
             settled_now = settle_trades(rows, events)
+            if client is not None:
+                live_ok, why = live_allowed(rows)
+                if live_ok:
+                    # Never place real orders unless the trade record can be written.
+                    try:
+                        save_trades(rows)
+                    except Exception as e:
+                        live_ok, why = False, f"live paused: cannot write {TRADES_CSV} ({e}); close it if open in Excel"
+                print(f"[*] {why}")
+                if live_ok and signals:
+                    go_live(signals, rows, client)
             if signals or settled_now:
                 save_trades(rows)
             if snaps:
