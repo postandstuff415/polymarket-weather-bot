@@ -55,7 +55,7 @@ from decimal import Decimal, ROUND_HALF_EVEN
 import requests
 
 import weather_model as wm
-from weather_bot import build_model, longshot_reason, now_utc  # also makes ¢ / °F printable on Windows
+from weather_bot import build_model, now_utc  # also makes ¢ / °F printable on Windows
 
 # =============================================================================
 # SETTINGS
@@ -376,13 +376,26 @@ def live_allowed(rows):
                   f"${open_cost:.2f} open of ${LIVE_MAX_OPEN_DOLLARS:.0f} cap")
 
 
+def longshot_reason(trade):
+    """Why a YES long shot shouldn't go live, or None."""
+    if trade["side"] != "YES":
+        return None
+    price, edge = float(trade["price"]), float(trade["edge"])
+    if price < LIVE_MIN_YES_PRICE:
+        return f"YES at {price * 100:.0f}¢ is under the {LIVE_MIN_YES_PRICE * 100:.0f}¢ live floor (long-shot bias)"
+    need = MIN_EDGE + LIVE_YES_LONGSHOT_EXTRA_EDGE
+    if price < LIVE_YES_LONGSHOT_BELOW and edge < need:
+        return f"YES at {price * 100:.0f}¢ needs {need * 100:.0f}¢ edge, has {edge * 100:.1f}¢ (long-shot bias)"
+    return None
+
+
 def place_live(trade, rows, client, held):
     """Send one real order for a signal. Returns (order_id, filled, count, raw_fill_px) or None."""
     live = [r for r in rows if r.get("mode") == "live"]
     if trade["market"] in held:
         print(f"    [live] {trade['market']}: account already holds this market, skipped")
         return None
-    why = longshot_reason(trade, MIN_EDGE, LIVE_MIN_YES_PRICE, LIVE_YES_LONGSHOT_BELOW, LIVE_YES_LONGSHOT_EXTRA_EDGE)
+    why = longshot_reason(trade)
     if why:
         print(f"    [live] {trade['market']}: {why}; kept as paper")
         return None

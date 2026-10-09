@@ -30,8 +30,6 @@ have settled (a data set; no profit requirement). Then:
   * If the test passes, size goes up one level, then one more per 50 settled live
     trades while still profitable, and steps back down if the last 30 live trades lose.
   * At any time, live losses totalling LIVE_KILL_LOSS stop live trading for good.
-  * YES long shots never go live: nothing under LIVE_MIN_YES_PRICE, and YES under
-    LIVE_YES_LONGSHOT_BELOW needs extra edge (long-shot bias; see the settings).
 """
 
 import argparse
@@ -85,12 +83,6 @@ LIVE_KILL_LOSS = 50.00           # live trading down this much in total -> back 
 # Or force one: "YES", "NO", "BOTH".
 LIVE_SIDE_MODE = "auto"
 LIVE_MIN_SIDE_TRADES = 20
-# Live YES long shots. Becker, "Microstructure of Wealth Transfer in Prediction Markets" (72M
-# Kalshi trades, 2021-2025): contracts under 20c win less often than their price implies, by far
-# the most for YES under 10c, and NO beats YES at most prices. Live only; paper still logs them.
-LIVE_MIN_YES_PRICE = 0.10        # no live YES bought below this
-LIVE_YES_LONGSHOT_BELOW = 0.20   # live YES below this price...
-LIVE_YES_LONGSHOT_EXTRA_EDGE = 0.03  # ...needs this much more than MIN_EDGE
 # =============================================================================
 
 KALSHI = "https://external-api.kalshi.com/trade-api/v2"
@@ -495,30 +487,12 @@ def live_allowed(rows):
                   f"live {len(live)} settled net ${live_net:+.2f}"), (contracts, cap, sides)
 
 
-def longshot_reason(trade, min_edge, min_yes_price=LIVE_MIN_YES_PRICE,
-                    longshot_below=LIVE_YES_LONGSHOT_BELOW, extra_edge=LIVE_YES_LONGSHOT_EXTRA_EDGE):
-    """Why a YES long shot shouldn't go live, or None. Also used by polymarket_weather_bot.py."""
-    if trade["side"] != "YES":
-        return None
-    price, edge = float(trade["price"]), float(trade["edge"])
-    if price < min_yes_price:
-        return f"YES at {price * 100:.0f}¢ is under the {min_yes_price * 100:.0f}¢ live floor (long-shot bias)"
-    if price < longshot_below and edge < min_edge + extra_edge:
-        return (f"YES at {price * 100:.0f}¢ needs {(min_edge + extra_edge) * 100:.0f}¢ edge, "
-                f"has {edge * 100:.1f}¢ (long-shot bias)")
-    return None
-
-
 def place_live(trade, rows, size):
     """Send a real order. Returns (order_id, filled_count) or None."""
     from strategy.order_manager import OrderManager
     contracts, cap, sides = size
     if trade["side"] not in sides:
         return None  # stays a paper trade
-    why = longshot_reason(trade, MIN_EDGE)
-    if why:
-        print(f"    [live] {trade['ticker']}: {why}; kept as paper")
-        return None
     # Live test cap, checked per order (one scan can produce several trades)
     live_rows = [r for r in rows if r.get("mode") == "live"]
     test_open = any(r.get("status") != "settled" for r in live_rows[:LIVE_TEST_TRADES])
