@@ -318,8 +318,15 @@ def live_client():
     return _client
 
 
+def account_balance(client):
+    """The USD balance entry: {'currentBalance', 'buyingPower', ...}."""
+    res = client.account.balances()
+    entries = res.get("balances") if isinstance(res.get("balances"), list) else [res]
+    return next((e for e in entries if e.get("currency", "USD") == "USD"), entries[0] if entries else {})
+
+
 def buying_power(client):
-    return float(client.account.balances().get("buyingPower") or 0.0)
+    return float(account_balance(client).get("buyingPower") or 0.0)
 
 
 def held_markets(client):
@@ -447,7 +454,7 @@ def go_live(signals, rows, client):
 def check_live():
     """Prove the keys work and show how the exchange reads our orders. Places nothing."""
     client = live_client()
-    bal = client.account.balances()
+    bal = account_balance(client)
     print(f"[ok] Keys work. Balance ${float(bal.get('currentBalance') or 0):.2f}, "
           f"buying power ${float(bal.get('buyingPower') or 0):.2f}")
     print(f"[ok] Markets with a position: {len(held_markets(client))}")
