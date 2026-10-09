@@ -50,7 +50,7 @@ MIN_HOURS_TO_CLOSE = 6.0
 # Sports markets "close" ~2 days after the game, so the close-time check above never
 # caught in-play games, where prices jump on every play and our bids get picked off.
 # Uses Kalshi's occurrence_datetime (game start); markets without one are unaffected.
-MIN_HOURS_BEFORE_EVENT = 1.0
+MIN_HOURS_BEFORE_EVENT = 3.0
 # ...and never in markets that close more than 7 days out (no long bets)
 MAX_HOURS_TO_CLOSE = 168.0
 # Spread risk across at most this many markets at once (positions + open orders)
