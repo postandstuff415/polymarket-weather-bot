@@ -76,7 +76,13 @@ LIVE_LEVELS = [(1, 100.0), (2, 200.0), (3, 300.0), (5, 500.0)]  # (contracts/tra
 LIVE_TRADES_PER_LEVEL = 50       # settled profitable live trades needed per level up
 LIVE_STEP_DOWN_WINDOW = 30       # if the last 30 live trades lose money, drop a level
 LIVE_KILL_LOSS = 50.00           # live trading down this much in total -> back to paper for good
-LIVE_ALLOW_NO = False            # NO trades = selling YES you don't own; off until tested
+# Which side(s) go live: "auto" = the side(s) whose settled paper trades made money
+# (at least LIVE_MIN_SIDE_TRADES each); if neither did, the side that lost less per trade.
+# weather_research.py (5.4M trades, Aug-Oct 2026): cheap YES bought at the ask lost ~15%
+# after fees on average, so the side is chosen by evidence, not fixed to YES.
+# Or force one: "YES", "NO", "BOTH".
+LIVE_SIDE_MODE = "auto"
+LIVE_MIN_SIDE_TRADES = 20
 # =============================================================================
 
 KALSHI = "https://external-api.kalshi.com/trade-api/v2"
@@ -409,9 +415,27 @@ def _daily(rows):
 
 
 # ---- Live (gated, automatic) ---------------------------------------------------
+def choose_live_sides(paper):
+    """Which side(s) to trade live, from settled paper trades. Returns (set, explanation)."""
+    if LIVE_SIDE_MODE in ("YES", "NO"):
+        return {LIVE_SIDE_MODE}, f"{LIVE_SIDE_MODE} only (forced)"
+    if LIVE_SIDE_MODE == "BOTH":
+        return {"YES", "NO"}, "YES+NO (forced)"
+    stats = {}
+    for side in ("YES", "NO"):
+        pn = [float(r["pnl"]) for r in paper if r.get("side") == side]
+        stats[side] = (len(pn), sum(pn), sum(pn) / len(pn) if pn else float("-inf"))
+    desc = " / ".join(f"{s} {n} trades ${net:+.2f}" for s, (n, net, _) in stats.items())
+    winners = {s for s, (n, net, _) in stats.items() if n >= LIVE_MIN_SIDE_TRADES and net > 0}
+    if winners:
+        return winners, f"{'+'.join(sorted(winners, reverse=True))} (profitable on paper: {desc})"
+    best = max(stats, key=lambda s: stats[s][2] if stats[s][0] else float("-inf"))
+    return {best}, (f"{best} (no side profitable with {LIVE_MIN_SIDE_TRADES}+ paper trades; "
+                    f"{best} did best per trade: {desc})")
+
+
 def live_allowed(rows):
-    """Returns (allowed, reason, (contracts, max_open_cost))."""
-    sides = {"YES", "NO"} if LIVE_ALLOW_NO else {"YES"}
+    """Returns (allowed, reason, (contracts, max_open_cost, sides))."""
     if not AUTO_GO_LIVE:
         return False, "AUTO_GO_LIVE is off", None
 
@@ -435,12 +459,12 @@ def live_allowed(rows):
         return False, (f"LIVE TEST FAILED: first {LIVE_TEST_TRADES} live trades net ${test_net:+.2f} "
                        f"after fees; paper only"), None
 
-    # Go-live gate: a data set of settled paper trades (no profit requirement).
-    # Only the kinds of trades that will actually be placed live count.
-    paper = [r for r in rows if r.get("mode") == "paper" and r.get("status") == "settled" and r.get("side") in sides]
+    # Go-live gate: a data set of settled paper trades, either side (no profit requirement)
+    paper = [r for r in rows if r.get("mode") == "paper" and r.get("status") == "settled"]
     paper_net = sum(float(r["pnl"]) for r in paper)
     if len(paper) < LIVE_MIN_SETTLED:
         return False, f"{len(paper)}/{LIVE_MIN_SETTLED} settled paper trades", None
+    sides, side_why = choose_live_sides(paper)
 
     # Size level from the live record; locked at the smallest size during the test
     level = 0
@@ -459,16 +483,16 @@ def live_allowed(rows):
     phase = (f"live test PASSED (${test_net:+.2f})" if test_done else
              f"live test {len(test)}/{LIVE_TEST_TRADES} placed, {len(test_settled)} settled, net ${test_net:+.2f}")
     return True, (f"LIVE level {level+1}/{len(LIVE_LEVELS)}: {contracts} contract(s), ${cap:.0f} max open | "
-                  f"{phase} | paper {len(paper)} trades net ${paper_net:+.2f} | "
-                  f"live {len(live)} settled net ${live_net:+.2f}"), (contracts, cap)
+                  f"{phase} | live side: {side_why} | paper {len(paper)} trades net ${paper_net:+.2f} | "
+                  f"live {len(live)} settled net ${live_net:+.2f}"), (contracts, cap, sides)
 
 
 def place_live(trade, rows, size):
     """Send a real order. Returns (order_id, filled_count) or None."""
     from strategy.order_manager import OrderManager
-    contracts, cap = size
-    if trade["side"] == "NO" and not LIVE_ALLOW_NO:
-        return None
+    contracts, cap, sides = size
+    if trade["side"] not in sides:
+        return None  # stays a paper trade
     # Live test cap, checked per order (one scan can produce several trades)
     live_rows = [r for r in rows if r.get("mode") == "live"]
     test_open = any(r.get("status") != "settled" for r in live_rows[:LIVE_TEST_TRADES])
