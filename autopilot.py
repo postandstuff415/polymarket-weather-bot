@@ -57,6 +57,10 @@ MIN_HOURS_BEFORE_EVENT = 3.0
 # Set False to trade every market type again. Exits on held positions are unaffected.
 GAME_LINES_ONLY = True
 ALLOWED_SERIES_SUFFIXES = ("SPREAD", "TOTAL", "GAME")
+# At most this many markets per game/event at once. A game's totals ladder (over 205,
+# 209, 211 ... 237) and its spread are one correlated bet: Oct 8 the bot bid on 9 markets
+# of HOU@DAL in two cycles. Game = the middle part of the ticker (e.g. 26OCT09HOUDAL).
+MAX_MARKETS_PER_GAME = 2
 # ...and never in markets that close more than 7 days out (no long bets)
 MAX_HOURS_TO_CLOSE = 168.0
 # Spread risk across at most this many markets at once (positions + open orders)
@@ -144,6 +148,17 @@ def fetch_cash_balance():
     except Exception as e:
         print(f"[!] Balance network error: {e}")
         return None
+
+
+def game_key(ticker: str) -> str:
+    """Event part of a ticker: KXNBATOTAL-26OCT09HOUDAL-237 and KXNBASPREAD-26OCT09HOUDAL-DAL9
+    both -> 26OCT09HOUDAL, so a game's spread and totals count together."""
+    parts = ticker.split("-")
+    return parts[1] if len(parts) >= 3 else ticker
+
+
+def resting_tickers_now(resting_orders: list) -> set:
+    return {ro.get("ticker") for ro in resting_orders}
 
 
 def is_allowed_market_type(ticker: str) -> bool:
@@ -410,8 +425,14 @@ try:
 
             active_tickers = {ro.get("ticker") for ro in resting_orders}.union(positions.keys())
             print(f"[*] Active markets: {len(active_tickers)} / {MAX_ACTIVE_MARKETS}")
+            # Markets already in use per game (whole-contract positions + resting orders)
+            per_game, resting_now = {}, resting_tickers_now(resting_orders)
+            for t in active_tickers:
+                if t in positions and abs(positions[t].get("position", 0.0)) < 1.0 and t not in resting_now:
+                    continue  # leftover dust doesn't count
+                per_game[game_key(t)] = per_game.get(game_key(t), 0) + 1
             placed_this_cycle = 0
-            skipped_price = skipped_time = skipped_live = skipped_type = 0
+            skipped_price = skipped_time = skipped_live = skipped_type = skipped_game = 0
 
             for m in spread_candidates:
                 if placed_this_cycle >= MAX_MARKETS_PER_PASS or len(active_tickers) >= MAX_ACTIVE_MARKETS:
@@ -421,6 +442,9 @@ try:
                     continue
                 if not is_allowed_market_type(ticker):
                     skipped_type += 1
+                    continue
+                if per_game.get(game_key(ticker), 0) >= MAX_MARKETS_PER_GAME:
+                    skipped_game += 1
                     continue
 
                 yes_bid = m["yes_bid"]
@@ -457,10 +481,13 @@ try:
                         reconciler.register_order(oid, ticker, "bid", target_bid)
                         log_trade(ticker, "ENTRY_BID", "BID", contract_size, target_bid, oid)
                         active_tickers.add(ticker)
+                        per_game[game_key(ticker)] = per_game.get(game_key(ticker), 0) + 1
                         placed_this_cycle += 1
 
             if skipped_type:
                 print(f"[*] Skipped {skipped_type} market(s) that aren't game lines (player props, hourly, etc.)")
+            if skipped_game:
+                print(f"[*] Skipped {skipped_game} market(s): already in {MAX_MARKETS_PER_GAME} markets on that game")
             if skipped_price or skipped_time or skipped_live:
                 print(f"[*] Skipped: {skipped_price} outside {int(MIN_ENTRY_PRICE*100)}-{int(MAX_ENTRY_PRICE*100)}¢ | "
                       f"{skipped_time} closing within {MIN_HOURS_TO_CLOSE:.0f}h, beyond 7 days, or no close time | "
