@@ -4,12 +4,14 @@ weather_model.py - the math behind weather_bot.py (no network calls here).
 How the daily high is modeled
 -----------------------------
 The day's official high = max(high already observed today, high still to come).
+Daily LOWS (LowModel) mirror this: min(low observed so far, low still to come).
 
   * Already observed: the max temperature reported by the settlement station since
     the climate day began. The true high is at least this (a little higher on
     average, because the station's official max is taken between hourly reports).
   * Still to come: the max of the NWS hourly forecast for the rest of the climate
-    day, with forecast error that grows with lead time.
+    day, with forecast error that grows with lead time, shifted by FORECAST_BIAS_F
+    (learned from settled markets by weather_calibration.py).
 
 Treating the two parts as independent, P(high <= x) is the product of their CDFs.
 Kalshi settles on the whole-degree reported high, so a bracket "65° to 66°"
@@ -25,7 +27,9 @@ from datetime import datetime, timedelta, timezone
 # ---- Model settings (calibrate these from the paper log) --------------------
 OBS_BIAS_F = 0.3          # official max tends to be a bit above the max hourly reading
 OBS_SIGMA_F = 0.8         # uncertainty of the observed part (rounding, C->F conversion)
-FORECAST_BIAS_F = 0.7     # daily max usually lands between hourly forecast points
+FORECAST_BIAS_F = 0.0     # added ONCE to the forecast part; weather_bot.py sets it from
+                          # weather_calibration.py (NWS forecast vs settled highs)
+FORECAST_BIAS_LOW_F = 0.0 # same for daily lows (NWS forecast low vs settled lows)
 FORECAST_SIGMA_BASE_F = 1.2
 FORECAST_SIGMA_PER_HOUR_F = 0.05
 FORECAST_SIGMA_MAX_F = 4.0
@@ -63,6 +67,23 @@ CITIES = {
     "KXHIGHTEWR":  ("KEWR", -5, "Newark"),
     "KXHIGHTTTN":  ("KTTN", -5, "Trenton"),
 }
+
+# Daily-LOW series -> the high series for the same city. Same station, same NWS climate
+# report (e.g. CLINYC) and same climate day, per Kalshi's market rules.
+LOW_SERIES = {
+    "KXLOWTNYC": "KXHIGHNY", "KXLOWTCHI": "KXHIGHCHI", "KXLOWTMIA": "KXHIGHMIA", "KXLOWTAUS": "KXHIGHAUS",
+    "KXLOWTLAX": "KXHIGHLAX", "KXLOWTDEN": "KXHIGHDEN", "KXLOWTPHIL": "KXHIGHPHIL", "KXLOWTPHX": "KXHIGHTPHX",
+    "KXLOWTHOU": "KXHIGHTHOU", "KXLOWTMIN": "KXHIGHTMIN", "KXLOWTOKC": "KXHIGHTOKC", "KXLOWTSFO": "KXHIGHTSFO",
+    "KXLOWTDC": "KXHIGHTDC", "KXLOWTBOS": "KXHIGHTBOS", "KXLOWTDAL": "KXHIGHTDAL", "KXLOWTSEA": "KXHIGHTSEA",
+    "KXLOWTLV": "KXHIGHTLV", "KXLOWTATL": "KXHIGHTATL", "KXLOWTSATX": "KXHIGHTSATX", "KXLOWTNOLA": "KXHIGHTNOLA",
+    "KXLOWTSAN": "KXHIGHTSAN", "KXLOWTSDF": "KXHIGHTSDF", "KXLOWTEWR": "KXHIGHTEWR", "KXLOWTTTN": "KXHIGHTTTN",
+}
+
+
+def city_for(series: str):
+    """(station, offset, name) for a high OR low series, or None."""
+    return CITIES.get(series) or CITIES.get(LOW_SERIES.get(series, ""))
+
 
 MONTHS = {m: i for i, m in enumerate(
     ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"], start=1)}
@@ -149,6 +170,33 @@ class HighModel:
         except (TypeError, ValueError):
             return None
         return None
+
+
+class LowModel(HighModel):
+    """Distribution of the day's true LOW (°F): min(low observed so far, low still to come)."""
+
+    def __init__(self, obs_min_f=None, future_min_f=None, future_lead_hours=0.0):
+        if obs_min_f is None and future_min_f is None:
+            raise ValueError("need an observation or a forecast")
+        # official min tends to be a bit BELOW the min hourly reading
+        self.obs_mu = None if obs_min_f is None else obs_min_f - OBS_BIAS_F
+        self.obs_sigma = OBS_SIGMA_F
+        self.fc_mu = None if future_min_f is None else future_min_f + FORECAST_BIAS_LOW_F
+        self.fc_sigma = forecast_sigma(future_lead_hours)
+
+    def cdf(self, x: float) -> float:
+        # P(low <= x) = 1 - P(both parts stay above x)
+        above = 1.0
+        if self.obs_mu is not None:
+            above *= 1.0 - _phi((x - self.obs_mu) / self.obs_sigma)
+        if self.fc_mu is not None:
+            above *= 1.0 - _phi((x - self.fc_mu) / self.fc_sigma)
+        return 1.0 - above
+
+
+def is_low(ticker: str) -> bool:
+    """True for daily-LOW markets/events (KXLOW...)."""
+    return str(ticker).startswith("KXLOW")
 
 
 # ---- Fees and edge ----------------------------------------------------------

@@ -22,6 +22,9 @@ Every scan:
    anything that doesn't parse or doesn't add up to ~100%.
 3. If buying YES or NO at the current best price beats MIN_EDGE after Polymarket
    US's taker fee, records a PAPER trade in polymarket_paper_trades.csv. One per market.
+   No new trades until the NWS forecast bias has been learned from MIN_CALIBRATION_CITY_DAYS
+   settled city-days (polymarket_calibration.py, weather model v4); forecasts are logged
+   meanwhile, and selling early keeps running.
 4. Fills in each paper trade's result and profit once its market resolves.
 
 Live mode (--live)
@@ -66,6 +69,7 @@ from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN
 
 import requests
 
+import polymarket_calibration as pcal
 import weather_model as wm
 from weather_bot import build_model, now_utc  # also makes ¢ / °F printable on Windows
 
@@ -78,6 +82,8 @@ MAX_EDGE = 0.30                  # an "edge" above 30¢ is almost always a data 
 MIN_PRICE, MAX_PRICE = 0.03, 0.97  # skip prices where 1¢ ticks dominate
 SUM_TOLERANCE = 0.04             # an event's brackets must add to ~100% or it's skipped
 MAX_CENTER_GAP_F = 2.0           # model and market more than 2°F apart = likely bad data, skip
+MIN_CALIBRATION_CITY_DAYS = 15   # no new trades until the forecast bias is learned from this many settled city-days
+CALIBRATE_EVERY_SECONDS = 3600   # cheap: settled events are cached
 TRADE_SAME_DAY = False           # same-day markets are priced off live readings we can't beat; log only
 DAYS_AHEAD = 2                   # look for events up to this many days past today
 SNAPSHOT_EVERY_SECONDS = 3600    # log every bracket's model vs market once an hour
@@ -307,6 +313,15 @@ def market_result(m):
     return None
 
 
+def winning_bracket(event):
+    """(low_f, high_f) of the bracket that settled YES (None = open end), or None if unsettled."""
+    for m in (get_event(event) or {}).get("markets", []):
+        if market_result(m) == "yes":
+            _, lo, hi = parse_bracket(m.get("description"))
+            return lo, hi
+    return None
+
+
 def settle_trades(rows, events):
     """Fill in results for trades whose markets have resolved. events: slug -> event cache."""
     changed = 0
@@ -334,6 +349,7 @@ def settle_trades(rows, events):
 
 # ---- Live (--live only) ---------------------------------------------------------------
 _client = None
+_calibrated_city_days = 0   # settled city-days behind the current forecast bias
 
 
 def live_client():
@@ -752,7 +768,8 @@ def scan(rows, take_snapshot, verbose=False):
                                       "model_center_f": f"{model.center():.1f}",
                                       "obs_max_f": "" if obs is None else f"{obs:.1f}",
                                       "future_max_f": "" if fut is None else f"{fut:.1f}"})
-                if m["slug"] in traded or not b["open"] or not gap_ok or not tradable_day:
+                if (m["slug"] in traded or not b["open"] or not gap_ok or not tradable_day
+                        or _calibrated_city_days < MIN_CALIBRATION_CITY_DAYS):
                     continue
                 best = best_trade(p, bid, ask, rate)
                 if not best:
@@ -822,9 +839,24 @@ def main():
         print("  POLYMARKET US WEATHER BOT  -  PAPER MODE: no orders are placed")
     print("=" * 66)
 
+    global _calibrated_city_days
     last_snapshot = 0.0
+    last_calibration = 0.0
     first_scan = True
     while True:
+        if time.time() - last_calibration >= CALIBRATE_EVERY_SECONDS:
+            try:
+                cal = pcal.calibrate(winning_bracket)
+            except Exception as e:
+                cal = pcal.load()   # keep the last saved bias
+                print(f"[!] Calibration failed ({e}); using the last saved one.")
+            wm.FORECAST_BIAS_F = float(cal.get("bias_f") or 0.0)
+            _calibrated_city_days = int(cal.get("city_days") or 0)
+            print(f"[*] Forecast calibration: {pcal.describe(cal)}")
+            if _calibrated_city_days < MIN_CALIBRATION_CITY_DAYS:
+                print(f"[*] Not trading yet: need {MIN_CALIBRATION_CITY_DAYS} settled city-days to calibrate "
+                      f"(have {_calibrated_city_days}); logging forecasts until then.")
+            last_calibration = time.time()
         try:
             rows = load_trades()
             take_snap = time.time() - last_snapshot >= SNAPSHOT_EVERY_SECONDS

@@ -3,6 +3,7 @@ weather_research.py - Who wins in Kalshi daily-high weather markets? (read-only,
 
     python weather_research.py               download (cached) + analyze
     python weather_research.py --refresh     re-download trades
+    python weather_research.py --lows        same analysis for the daily-LOW markets (KXLOWT...)
 
 Same method as Becker's "Microstructure of Wealth Transfer" (72M Kalshi trades), restricted
 to the daily-high temperature markets weather_bot.py trades. For every settled market in
@@ -13,7 +14,7 @@ Per contract:  taker excess return = (1 if taker's side won else 0) - price paid
                maker excess return = -(taker excess)        (before fees)
 Taker fee (Kalshi): 7% x price x (1 - price) per contract.
 
-Cached raw data: research_data/weather_trades.csv.gz
+Cached raw data: research_data/weather_trades.csv.gz (lows: weather_low_trades.csv.gz)
 """
 
 import argparse
@@ -35,6 +36,9 @@ BASE = "https://external-api.kalshi.com/trade-api/v2"
 PREFIX = "/trade-api/v2"
 DATA_DIR = "research_data"
 TRADES_FILE = os.path.join(DATA_DIR, "weather_trades.csv.gz")
+LOW_TRADES_FILE = os.path.join(DATA_DIR, "weather_low_trades.csv.gz")
+SERIES = list(wm.CITIES)          # --lows switches these to the daily-low series
+KIND = "HIGH"
 FIELDS = ["series", "ticker", "result", "time", "yes_price", "taker_side", "count"]
 
 _auth = KalshiAuth()
@@ -93,7 +97,7 @@ def market_trades(market):
 def download():
     os.makedirs(DATA_DIR, exist_ok=True)
     markets = []
-    for series in wm.CITIES:
+    for series in SERIES:
         ms = settled_markets(series)
         markets += ms
         print(f"  {series:<14} {len(ms):>4} settled markets")
@@ -122,7 +126,7 @@ def bucket(p, edges=(0.05, 0.10, 0.20, 0.35, 0.50, 0.65, 0.80, 0.90, 0.95)):
 
 def timing(series, ticker, t):
     """When the trade happened vs the climate day the market is about (local standard time)."""
-    city = wm.CITIES.get(series)
+    city = wm.city_for(series)
     day = wm.event_date(ticker.rsplit("-", 1)[0])
     if not city or not day:
         return "?"
@@ -199,7 +203,7 @@ def analyze():
         return
     line = "=" * 92
     print("\n" + line)
-    print(f"  KALSHI DAILY-HIGH WEATHER MARKETS: {total_t.n:,} trades, {total_t.c:,.0f} contracts, "
+    print(f"  KALSHI DAILY-{KIND} WEATHER MARKETS: {total_t.n:,} trades, {total_t.c:,.0f} contracts, "
           f"{first:%Y-%m-%d} to {last:%Y-%m-%d}")
     print(line)
     tr = lambda a: a.pnl / a.cost if a.cost else 0.0
@@ -240,7 +244,7 @@ def analyze():
     print("\n  5) BY CITY: taker return after fees (negative = takers lose to makers)")
     print(f"     {'city':<28}{'contracts':>13}{'taker after fee':>17}{'maker ret':>11}")
     for s, (a, m) in sorted(by_city.items(), key=lambda kv: (kv[1][0].pnl - kv[1][0].fee) / max(kv[1][0].cost, 1)):
-        print(f"     {wm.CITIES[s][2][:28]:<28}{a.c:>13,.0f}{(a.pnl - a.fee) / a.cost:>+17.2%}{tr(m):>+11.2%}")
+        print(f"     {wm.city_for(s)[2][:28]:<28}{a.c:>13,.0f}{(a.pnl - a.fee) / a.cost:>+17.2%}{tr(m):>+11.2%}")
     print("\n  Note: averages over ALL traders. A model that picks its trades can beat (or trail) these.")
     print()
 
@@ -248,7 +252,11 @@ def analyze():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--refresh", action="store_true")
+    ap.add_argument("--lows", action="store_true", help="daily-low markets instead of daily highs")
     args = ap.parse_args()
+    if args.lows:
+        global TRADES_FILE, SERIES, KIND
+        TRADES_FILE, SERIES, KIND = LOW_TRADES_FILE, list(wm.LOW_SERIES), "LOW"
     if args.refresh or not os.path.exists(TRADES_FILE):
         download()
     analyze()
