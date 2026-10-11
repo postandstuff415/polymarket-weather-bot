@@ -14,7 +14,7 @@ import csv
 import os
 from collections import defaultdict
 
-TRADES_CSV = "weather_paper_trades_v3.csv"
+TRADES_CSV = "weather_paper_trades_v4.csv"
 
 
 def main():
@@ -55,10 +55,12 @@ def main():
         hits = buckets[b]
         print(f"    model {b*10:>3}-{b*10+10}%: won {sum(hits)}/{len(hits)} = {sum(hits)/len(hits):.0%}")
 
-    for label, key in (("city", "city"), ("side", "side")):
+    kind = lambda r: "daily LOW (paper only)" if str(r.get("event", "")).startswith("KXLOW") else "daily HIGH"
+    for label, key in (("market type", kind), ("city", lambda r: r.get("city", "?")),
+                       ("side", lambda r: r.get("side", "?"))):
         groups = defaultdict(list)
         for r in settled:
-            groups[r.get(key, "?")].append(float(r["pnl"]))
+            groups[key(r)].append(float(r["pnl"]))
         print(f"\n  By {label}:")
         for k, v in sorted(groups.items(), key=lambda kv: sum(kv[1])):
             print(f"    {k:<28} {len(v):>4} trades   ${sum(v):+8.2f}")

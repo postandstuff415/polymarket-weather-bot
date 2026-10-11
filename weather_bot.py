@@ -14,7 +14,7 @@ What it does every few minutes
    every temperature bracket (see weather_model.py).
 3. Compares that probability with the market price. If buying YES or NO is worth at
    least MIN_EDGE after Kalshi's fee, it records a PAPER trade (price, fee, model
-   probability) in weather_paper_trades.csv. One trade per market, ever.
+   probability) in weather_paper_trades.csv. One trade per city-day (its best-edge bracket), ever.
 4. When markets settle, it fills in each paper trade's real result and profit.
 
 It runs alongside autopilot.py. autopilot.py now ignores all KXHIGH/KXLOW markets,
@@ -23,6 +23,7 @@ so the two bots never touch each other's markets or orders.
 Going live
 ----------
 With AUTO_GO_LIVE on, the bot switches itself to real money once 100 paper trades
+(= 100 independent city-days, since it takes one trade per city-day)
 have settled (a data set; no profit requirement). Then:
   * LIVE TEST: the first 100 live trades run at 1 contract ($100 max open). After
     the 100th is placed, no more live trades until all 100 settle. If they didn't
@@ -41,6 +42,7 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
+import weather_calibration as wcal
 import weather_model as wm
 from scaler import daily_stats
 
@@ -64,11 +66,16 @@ SNAPSHOT_EVERY_SECONDS = 3600    # log every bracket's model vs market once an h
 MAX_CENTER_GAP_F = 2.0           # model and market more than 2°F apart = likely bad data, skip
 MAX_EDGE = 0.30                  # an "edge" above 30¢ is almost always a data problem, not an opportunity
 TRADE_SAME_DAY = False           # same-day markets are priced off live readings we can't beat; log only
+MIN_CALIBRATION_CITY_DAYS = 15   # no trades until the forecast bias is learned from this many settled city-days
+# Daily LOW markets (KXLOWT...): weather_research.py --lows found takers there made money on
+# average (+1.1% after fees, Aug-Oct 2026), unlike highs (-2.4%). Paper only, with their
+# own calibration and their own paper record; they never count toward the live gate.
+TRADE_LOWS = True
 
 # Live trading. ON: the bot switches to REAL MONEY by itself once the paper record
 # passes the gate below. Set AUTO_GO_LIVE = False to stay on paper no matter what.
 AUTO_GO_LIVE = True              # go live automatically once the paper record earns it
-LIVE_MIN_SETTLED = 100           # settled paper trades required before going live (no profit test)
+LIVE_MIN_SETTLED = 100           # settled paper trades (= city-days) required before going live (no profit test)
 LIVE_TEST_TRADES = 100           # live test: the first 100 live trades run at the smallest size...
                                  # ...and if they aren't profitable after fees, live stops for good
 LIVE_MIN_T = 2.0                 # live per-day profits must be clearly above zero to size up
@@ -89,14 +96,17 @@ KALSHI = "https://external-api.kalshi.com/trade-api/v2"
 NWS = "https://api.weather.gov"
 NWS_HEADERS = {"User-Agent": "(kalshi-weather-bot, postandstuff415@gmail.com)",
                "Accept": "application/geo+json"}
-TRADES_CSV = "weather_paper_trades_v3.csv"   # earlier model versions are kept in _v1/_v2 files
-SNAPSHOT_CSV = "weather_model_log_v3.csv"
+TRADES_CSV = "weather_paper_trades_v4.csv"   # earlier model versions are kept in _v1/_v2/_v3 files
+SNAPSHOT_CSV = "weather_model_log_v4.csv"    # v4: forecast bias applied once and calibrated from data
+CALIBRATE_EVERY_SECONDS = 3600   # cheap: settled events are cached
 TRADE_FIELDS = ["time_utc", "mode", "ticker", "event", "city", "side", "price", "fee", "count",
                 "model_win_prob", "edge", "yes_bid", "yes_ask", "model_center_f", "obs_max_f",
                 "future_max_f", "status", "result", "pnl", "order_id"]
 SNAP_FIELDS = ["time_utc", "ticker", "model_p_yes", "yes_bid", "yes_ask", "model_center_f", "obs_max_f", "future_max_f"]
+# For daily-LOW rows (KXLOW...), obs_max_f / future_max_f hold the observed / forecast MINIMUM.
 
 _auth = None
+_calibrated_city_days = {"high": 0, "low": 0}
 
 
 def auth():
@@ -157,7 +167,7 @@ def open_markets(series):
 _station_cache = {}   # station -> (lat, lon)
 _urls = {}            # station -> (forecastHourly URL, forecastGridData URL)
 _fc_cache = {}        # station -> (fetched_at, hourly periods)
-_grid_cache = {}      # station -> (fetched_at, [(start, end, max_f)])
+_grid_cache = {}      # (station, field) -> (fetched_at, [(start, end, temp_f)])
 _obs_cache = {}       # (station, window_start) -> (fetched_at, (max_f, latest_f, latest_time))
 
 
@@ -193,12 +203,12 @@ def hourly_forecast(station):
     return periods
 
 
-def grid_daily_max(station):
-    """NWS official daily max-temperature forecasts: [(valid_start, valid_end, max_f)]."""
-    hit = _grid_cache.get(station)
+def grid_daily_max(station, field="maxTemperature"):
+    """NWS official daily max- (or minTemperature) forecasts: [(valid_start, valid_end, temp_f)]."""
+    hit = _grid_cache.get((station, field))
     if hit and time.time() - hit[0] < 1800:
         return hit[1]
-    mt = nws_get(station_urls(station)[1])["properties"].get("maxTemperature") or {}
+    mt = nws_get(station_urls(station)[1])["properties"].get(field) or {}
     unit = mt.get("uom", "wmoUnit:degC")
     out = []
     for v in mt.get("values", []):
@@ -215,12 +225,12 @@ def grid_daily_max(station):
             except ValueError:
                 pass
         out.append((t0, t0 + timedelta(hours=hours), _c_to_f(v["value"], unit)))
-    _grid_cache[station] = (time.time(), out)
+    _grid_cache[(station, field)] = (time.time(), out)
     return out
 
 
 def observations(station, start, end):
-    """(max temp so far, latest temp, latest time) for the climate day, from the station itself."""
+    """(max temp so far, min temp so far, latest temp, latest time) for the climate day, from the station itself."""
     key = (station, start.isoformat())
     hit = _obs_cache.get(key)
     if hit and time.time() - hit[0] < 600:
@@ -228,7 +238,7 @@ def observations(station, start, end):
     data = nws_get(f"{NWS}/stations/{station}/observations",
                    {"start": start.isoformat().replace("+00:00", "Z"),
                     "end": min(end, now_utc()).isoformat().replace("+00:00", "Z")})
-    best = latest = latest_t = None
+    best = low = latest = latest_t = None
     for f in data.get("features", []):
         props = f.get("properties") or {}
         t = props.get("temperature") or {}
@@ -237,9 +247,10 @@ def observations(station, start, end):
             continue
         val = _c_to_f(t["value"], t.get("unitCode", ""))
         best = val if best is None else max(best, val)
+        low = val if low is None else min(low, val)
         if latest_t is None or ts > latest_t:
             latest, latest_t = val, ts
-    result = (best, latest, latest_t)
+    result = (best, low, latest, latest_t)
     _obs_cache[key] = (time.time(), result)
     return result
 
@@ -263,53 +274,64 @@ def forecast_error_now(periods, latest, latest_t):
     return 0.0
 
 
-def build_model(station, offset, day):
+def build_model(station, offset, day, kind="high"):
     """
-    Model inputs for one city-day:
-      obs     max temperature already observed today at the station
-      fut     forecast max for the rest of the day, corrected for how far the
-              station is currently running from the forecast (that error fades
-              over ~6 hours), and using the NWS official daily-max forecast
+    Model inputs for one city-day (kind "high" or "low"):
+      obs     max (low: min) temperature already observed today at the station
+      fut     forecast max (low: min) for the rest of the day, corrected for how far
+              the station is currently running from the forecast (that error fades
+              over ~6 hours), and using the NWS official daily max/min forecast
     """
+    low = kind == "low"
+    pick = min if low else max
     start, end = wm.climate_day_window_utc(day, offset)
     now = now_utc()
     if now >= end:
         return None, None, None
-    peak = start + timedelta(hours=15)                 # ~3 PM local standard time
+    # When the extreme usually happens: highs ~3 PM, lows ~6 AM local standard time
+    peak = start + timedelta(hours=6 if low else 15)
     lead = max(0.0, (peak - now).total_seconds() / 3600.0)
 
     periods = hourly_forecast(station)
     obs = latest = latest_t = None
     if now > start:
-        obs, latest, latest_t = observations(station, start, end)
+        o_max, o_min, latest, latest_t = observations(station, start, end)
+        obs = o_min if low else o_max
     err = forecast_error_now(periods, latest, latest_t)
 
     # Hourly path: remaining hours of the climate day, error-corrected
-    hourly_max = None
+    hourly_x = None
     for p in periods:
         t0 = parse_iso(p.get("startTime"))
         if t0 is None or t0 < start or t0 >= end or t0 + timedelta(hours=1) <= now:
             continue
         h_ahead = max(0.0, (t0 - now).total_seconds() / 3600.0)
         temp = _period_temp(p) + err * wm.math.exp(-h_ahead / wm.ERROR_DECAY_HOURS)
-        hourly_max = temp if hourly_max is None else max(hourly_max, temp)
-    if hourly_max is not None:
-        hourly_max += wm.FORECAST_BIAS_F
+        hourly_x = temp if hourly_x is None else pick(hourly_x, temp)
+    # No bias here: the model adds wm.FORECAST_BIAS_F / FORECAST_BIAS_LOW_F once
 
-    # Official daily max for this date (its daytime window must still be ahead of us)
-    grid_max = None
-    for t0, t1, v in grid_daily_max(station):
-        if start <= t0 < end and now < t1 - timedelta(hours=3):
-            grid_max = v + err * wm.math.exp(-lead / wm.ERROR_DECAY_HOURS)
+    # Official forecast for this date, while its window is still ahead of us.
+    # Max: the daytime period starting on this date. Min: the overnight period
+    # ENDING on this date's morning (e.g. 8 PM - 10 AM), when the low usually happens.
+    grid_x = None
+    for t0, t1, v in grid_daily_max(station, "minTemperature" if low else "maxTemperature"):
+        in_day = (start < t1 <= end) if low else (start <= t0 < end)
+        if in_day and now < t1 - timedelta(hours=3):
+            grid_x = v + err * wm.math.exp(-lead / wm.ERROR_DECAY_HOURS)
             break
 
-    if grid_max is not None and hourly_max is not None:
-        fut = grid_max if now < start else (grid_max + hourly_max) / 2.0
+    if grid_x is not None and hourly_x is not None:
+        if now < start:
+            # Next day: the official forecast; for lows also a colder late evening if forecast
+            fut = pick(grid_x, hourly_x) if low else grid_x
+        else:
+            fut = (grid_x + hourly_x) / 2.0
     else:
-        fut = grid_max if grid_max is not None else hourly_max
+        fut = grid_x if grid_x is not None else hourly_x
     if obs is None and fut is None:
         return None, None, None
-    return wm.HighModel(obs, fut, lead), obs, fut
+    model = wm.LowModel(obs, fut, lead) if low else wm.HighModel(obs, fut, lead)
+    return model, obs, fut
 
 
 def market_center_f(ms):
@@ -399,8 +421,9 @@ def settle_trades(rows):
     return changed
 
 
-def paper_summary(rows):
-    settled = [r for r in rows if r.get("status") == "settled" and r.get("mode") == "paper"]
+def paper_summary(rows, low=False):
+    settled = [r for r in rows if r.get("status") == "settled" and r.get("mode") == "paper"
+               and wm.is_low(r.get("event", "")) == low]
     net = sum(float(r["pnl"]) for r in settled)
     return len(settled), net
 
@@ -460,7 +483,8 @@ def live_allowed(rows):
                        f"after fees; paper only"), None
 
     # Go-live gate: a data set of settled paper trades, either side (no profit requirement)
-    paper = [r for r in rows if r.get("mode") == "paper" and r.get("status") == "settled"]
+    paper = [r for r in rows if r.get("mode") == "paper" and r.get("status") == "settled"
+             and not wm.is_low(r.get("event", ""))]   # daily lows have their own paper record
     paper_net = sum(float(r["pnl"]) for r in paper)
     if len(paper) < LIVE_MIN_SETTLED:
         return False, f"{len(paper)}/{LIVE_MIN_SETTLED} settled paper trades", None
@@ -491,8 +515,8 @@ def place_live(trade, rows, size):
     """Send a real order. Returns (order_id, filled_count) or None."""
     from strategy.order_manager import OrderManager
     contracts, cap, sides = size
-    if trade["side"] not in sides:
-        return None  # stays a paper trade
+    if trade["side"] not in sides or wm.is_low(trade["event"]):
+        return None  # stays a paper trade (daily lows are paper only)
     # Live test cap, checked per order (one scan can produce several trades)
     live_rows = [r for r in rows if r.get("mode") == "live"]
     test_open = any(r.get("status") != "settled" for r in live_rows[:LIVE_TEST_TRADES])
@@ -528,13 +552,17 @@ def place_live(trade, rows, size):
 
 # ---- One scan -------------------------------------------------------------------
 def scan(rows, live_ok, take_snapshot, verbose=False, live_size=None):
-    traded = {r["ticker"] for r in rows}
+    # One trade per city-day: brackets of the same event win or lose together, so each
+    # settled trade is one independent result (the go-live gates count these).
+    traded_events = {r["event"] for r in rows}
     signals, snapshots, problems = [], [], []
     now = now_utc()
 
-    for i, (series, (station, offset, city)) in enumerate(wm.CITIES.items(), 1):
+    markets_to_scan = [(s, "high") for s in wm.CITIES] + ([(s, "low") for s in wm.LOW_SERIES] if TRADE_LOWS else [])
+    for i, (series, kind) in enumerate(markets_to_scan, 1):
+        station, offset, city = wm.city_for(series)
         if verbose:
-            print(f"  [{i:>2}/{len(wm.CITIES)}] {city:<26}", end=" ", flush=True)
+            print(f"  [{i:>2}/{len(markets_to_scan)}] {city + (' (low)' if kind == 'low' else ''):<32}", end=" ", flush=True)
         try:
             markets = open_markets(series)
         except Exception as e:
@@ -557,7 +585,7 @@ def scan(rows, live_ok, take_snapshot, verbose=False, live_size=None):
             if hours_left > MAX_HOURS_TO_CLOSE or hours_left * 60 < MIN_MINUTES_TO_CLOSE:
                 continue
             try:
-                model, obs, fut = build_model(station, offset, day)
+                model, obs, fut = build_model(station, offset, day, kind)
             except Exception as e:
                 problems.append(f"{city}: weather data unavailable ({e})")
                 continue
@@ -586,6 +614,7 @@ def scan(rows, live_ok, take_snapshot, verbose=False, live_size=None):
             day_start, _ = wm.climate_day_window_utc(day, offset)
             tradable_day = TRADE_SAME_DAY or now < day_start
 
+            pick = None
             for m in ms:
                 tkr, p = m["ticker"], probs[m["ticker"]]
                 bid, ask = money(m, "yes_bid"), money(m, "yes_ask")
@@ -594,7 +623,8 @@ def scan(rows, live_ok, take_snapshot, verbose=False, live_size=None):
                                       "yes_bid": bid, "yes_ask": ask, "model_center_f": f"{model.center():.1f}",
                                       "obs_max_f": "" if obs is None else f"{obs:.1f}",
                                       "future_max_f": "" if fut is None else f"{fut:.1f}"})
-                if tkr in traded or not gap_ok or not tradable_day:
+                if (event_ticker in traded_events or not gap_ok or not tradable_day
+                        or _calibrated_city_days[kind] < MIN_CALIBRATION_CITY_DAYS):
                     continue
                 best = wm.best_trade(p, bid, ask)
                 if not best:
@@ -603,14 +633,18 @@ def scan(rows, live_ok, take_snapshot, verbose=False, live_size=None):
                 trade_price = ask if side == "YES" else bid
                 if edge < MIN_EDGE or edge > MAX_EDGE or not (MIN_PRICE <= trade_price <= MAX_PRICE):
                     continue
-                signals.append({
+                if pick is not None and edge <= float(pick["edge"]):
+                    continue
+                pick = {
                     "time_utc": now.isoformat(), "mode": "paper", "ticker": tkr, "event": event_ticker,
                     "city": city, "side": side, "price": f"{cost:.4f}", "fee": f"{fee:.2f}", "count": 1,
                     "model_win_prob": f"{win_p:.4f}", "edge": f"{edge:.4f}", "yes_bid": bid, "yes_ask": ask,
                     "model_center_f": f"{model.center():.1f}",
                     "obs_max_f": "" if obs is None else f"{obs:.1f}",
                     "future_max_f": "" if fut is None else f"{fut:.1f}",
-                    "status": "open", "result": "", "pnl": "", "order_id": ""})
+                    "status": "open", "result": "", "pnl": "", "order_id": ""}
+            if pick:
+                signals.append(pick)   # the best-edge bracket of this city-day
 
     for s in signals:
         if live_ok and live_size:
@@ -642,17 +676,19 @@ def print_cycle(signals, problems, rows):
     for s in signals:
         print(f"  [{s['mode'].upper()}] {s['side']:<3} {s['ticker']:<32} @ ${float(s['price']):.2f}"
               f"  model {float(s['model_win_prob']):.0%}  edge {float(s['edge'])*100:+.1f}¢"
-              f"  (model high {s['model_center_f']}°F)")
+              f"  (model {'low' if wm.is_low(s['event']) else 'high'} {s['model_center_f']}°F)")
     if not signals:
         print("  No new trades this scan (nothing beat the edge threshold).")
     for p in problems[:15]:
         print(f"  [!] {p}")
     n, net = paper_summary(rows)
+    ln, lnet = paper_summary(rows, low=True)
     open_n = sum(1 for r in rows if r.get("status") == "open")
-    print(f"  Paper record: {n} settled, net ${net:+.2f} | {open_n} open")
+    print(f"  Paper record: highs {n} settled, net ${net:+.2f} | lows {ln} settled, net ${lnet:+.2f} | {open_n} open")
 
 
 def main():
+    global _calibrated_city_days
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true", help="run one scan and exit")
     args = ap.parse_args()
@@ -663,8 +699,28 @@ def main():
     print("=" * 64)
 
     last_snapshot = 0.0
+    last_calibration = 0.0
     first_scan = True
     while True:
+        if time.time() - last_calibration >= CALIBRATE_EVERY_SECONDS:
+            try:
+                cal = wcal.calibrate(kalshi_get)
+            except Exception as e:
+                cal = wcal.load()   # keep the last saved bias
+                print(f"[!] Calibration failed ({e}); using the last saved one.")
+            low_cal = cal.get("low") or {}
+            wm.FORECAST_BIAS_F = float(cal.get("bias_f") or 0.0)
+            wm.FORECAST_BIAS_LOW_F = float(low_cal.get("bias_f") or 0.0)
+            _calibrated_city_days = {"high": int(cal.get("city_days") or 0),
+                                     "low": int(low_cal.get("city_days") or 0)}
+            print(f"[*] Forecast calibration, highs: {wcal.describe(cal)}")
+            if TRADE_LOWS:
+                print(f"[*] Forecast calibration, lows:  {wcal.describe(low_cal)}")
+            for kind, n in _calibrated_city_days.items():
+                if n < MIN_CALIBRATION_CITY_DAYS and (kind == "high" or TRADE_LOWS):
+                    print(f"[*] Not trading {kind}s yet: need {MIN_CALIBRATION_CITY_DAYS} settled city-days to "
+                          f"calibrate (have {n}); logging forecasts until then.")
+            last_calibration = time.time()
         try:
             # Inside the try: a locked/unreadable CSV used to crash the bot for good
             # (run_weather.bat does not restart it).

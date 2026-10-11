@@ -18,6 +18,8 @@ weather_model_log*.csv
 polymarket_paper_trades*.csv
 polymarket_model_log*.csv
 polymarket_exit_log*.csv
+polymarket_calibration.json
+weather_calibration.json
 
 # Backups from the Oct 8 update
 *.pre-oct8
