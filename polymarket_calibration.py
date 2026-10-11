@@ -13,6 +13,13 @@ observed max yet: the next-day forecasts the bot actually trades on). Each settl
 counts once, and the bias is shrunk toward 0 while data is scarce (weather_calibration's
 PRIOR_CITY_DAYS). City-days won by an open-ended bracket have no midpoint and are skipped.
 
+Seeded from Kalshi: the Kalshi weather bot learns the same quantity (NWS next-day forecast vs
+the settled high) for 24 cities, incl. these 5 stations. As of 2026-10-11 it had 40 settled
+city-days with NWS running +0.52°F cold. That is used as a prior worth SEED_CITY_DAYS city-days:
+    bias = (sum of own residuals + SEED_CITY_DAYS x SEED_BIAS_F) / (own city-days + SEED_CITY_DAYS)
+and the seed counts toward the bot's calibration gate, so it trades from the start while its own
+settled data takes over. Set SEED_CITY_DAYS = 0 to go back to own-data-only.
+
 polymarket_weather_bot.py runs this at startup and every hour, and uses the result.
 Results are cached in polymarket_calibration.json, so settled events are fetched once.
 """
@@ -28,6 +35,8 @@ import weather_calibration as wcal
 
 CALIBRATION_JSON = "polymarket_calibration.json"
 SNAPSHOT_CSV = "polymarket_model_log.csv"
+SEED_BIAS_F = 0.5        # Kalshi weather_calibration.json, 2026-10-11: 40 next-day city-days, raw mean +0.52°F
+SEED_CITY_DAYS = 15      # the seed's weight, in settled city-days
 MARKET_EVENT = re.compile(r"^tc-(temp-[a-z]+high-(\d{4})-(\d{2})-(\d{2}))-")   # market slug -> event slug, date
 
 
@@ -60,6 +69,30 @@ def event_day(event):
     return date.fromisoformat(event[-10:])
 
 
+def seeded_stats(residuals):
+    """wcal._stats, but shrunk toward the Kalshi seed instead of 0; the seed counts as city-days."""
+    cal = wcal._stats(residuals)
+    n = len(residuals)
+    bias = (sum(residuals) + SEED_CITY_DAYS * SEED_BIAS_F) / max(1, n + SEED_CITY_DAYS)
+    cal.update(bias_f=round(max(-wcal.MAX_BIAS_F, min(wcal.MAX_BIAS_F, bias)), 2),
+               city_days=n + SEED_CITY_DAYS, own_city_days=n, seed_bias_f=SEED_BIAS_F, seed_city_days=SEED_CITY_DAYS)
+    return cal
+
+
+def describe(cal):
+    if not cal.get("seed_city_days"):
+        return wcal.describe(cal)
+    own = cal.get("own_city_days", 0)
+    text = f"bias {cal['bias_f']:+.1f}°F = Kalshi seed {cal['seed_bias_f']:+.1f}°F (worth {cal['seed_city_days']} city-days)"
+    if own:
+        sd = cal.get("residual_sd_f")
+        text += (f" + {own} own settled city-days (raw mean {cal['mean_residual_f']:+.1f}°F"
+                 + (f", spread {sd:.1f}°F" if sd is not None else "") + ")")
+    else:
+        text += " + no own settled city-days yet"
+    return text
+
+
 def calibrate(winning_bracket, path=SNAPSHOT_CSV):
     """Recompute the bias, save it, and return the calibration dict.
     winning_bracket(event) -> (low_f, high_f) of the bracket that settled YES (None = open end),
@@ -81,7 +114,7 @@ def calibrate(winning_bracket, path=SNAPSHOT_CSV):
 
     residuals = {e: actuals[e] - statistics.mean(forecasts[e])
                  for e in forecasts if isinstance(actuals.get(e), float)}
-    cal = wcal._stats(list(residuals.values()))
+    cal = seeded_stats(list(residuals.values()))
     cal.update({
         "tail_city_days_skipped": sum(1 for e in forecasts if actuals.get(e) == "tail"),
         "updated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -94,8 +127,6 @@ def calibrate(winning_bracket, path=SNAPSHOT_CSV):
     os.replace(tmp, CALIBRATION_JSON)
     return cal
 
-
-describe = wcal.describe
 
 
 if __name__ == "__main__":
