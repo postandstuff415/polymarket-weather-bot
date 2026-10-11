@@ -23,7 +23,8 @@ Every scan:
 3. If buying YES or NO at the current best price beats MIN_EDGE after Polymarket
    US's taker fee, records a PAPER trade in polymarket_paper_trades.csv. One per market.
    No new trades until the NWS forecast bias has been learned from MIN_CALIBRATION_CITY_DAYS
-   settled city-days (polymarket_calibration.py, weather model v4); forecasts are logged
+   settled city-days (polymarket_calibration.py, weather model v4; seeded with 15 from Kalshi,
+   so this gate starts open); forecasts are logged
    meanwhile, and selling early keeps running.
 4. Fills in each paper trade's result and profit once its market resolves.
 
@@ -36,8 +37,8 @@ Needs POLYMARKET_KEY_ID and POLYMARKET_SECRET_KEY in a .env file next to this sc
   * LIVE_DOLLARS_PER_TRADE per order, whole contracts
   * never more than LIVE_MAX_OPEN_DOLLARS in unsettled live trades, and never more
     than LIVE_MAX_TRADES_PER_DAY new live trades per day
-  * at most LIVE_MAX_PER_EVENT live trades per city/day, and at most one YES: brackets are
-    exclusive, so two YES bets on one event can't both win (best edge is placed first)
+  * at most LIVE_MAX_PER_EVENT live trade per city/day (best edge is placed first): its brackets
+    win or lose together, so one bet per city-day keeps live results independent
   * no YES long shots: nothing under LIVE_MIN_YES_PRICE, and YES under LIVE_YES_LONGSHOT_BELOW
     needs extra edge (long-shot bias; see the settings)
   * kill switch: once settled live trades are down LIVE_KILL_LOSS, live stops for good
@@ -93,7 +94,8 @@ DEFAULT_FEE_RATE = 0.0695        # Polymarket US taker fee: rate x C x p x (1-p)
 LIVE_DOLLARS_PER_TRADE = 3.00    # spend about this much per trade (whole contracts, at least 1)
 LIVE_MAX_OPEN_DOLLARS = 60.00    # most money ever tied up in unsettled live trades
 LIVE_MAX_TRADES_PER_DAY = 10     # new live trades per UTC day
-LIVE_MAX_PER_EVENT = 2           # live trades per city/day (one event); correlated bets
+LIVE_MAX_PER_EVENT = 1           # live trades per city/day (one event): brackets of one city-day win or
+                                 # lose together, so a second bet adds risk, not diversification
 LIVE_MAX_YES_PER_EVENT = 1       # only one bracket can win, so a second YES is a sure partial loss
 # Live YES long shots. Becker, "Microstructure of Wealth Transfer in Prediction Markets" (72M
 # Kalshi trades, 2021-2025): contracts under 20c win less often than their price implies, by far
